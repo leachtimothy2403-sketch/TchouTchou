@@ -1,0 +1,31 @@
+# SQLite databases (raw + permanent layers) -- generated locally on each run, not versioned.
+# See tchoutchou_ingest/README.md for the schema; the VPS will create its own tchoutchou.db.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.mypy_cache/
+
+# SNCF static GTFS reference export -- large third-party data (ODbL), not this project's
+# own code. Download fresh via https://transport.data.gouv.fr/datasets/horaires-sncf
+# (see README's "Legal" section) rather than versioning a stale copy here.
+Export_OpenData_SNCF_GTFS_NewTripId/
+Export_OpenData_SNCF_GTFS_NewTripId.zip
+
+# FUSE mount artifacts (Cowork sandbox cruft, not project files)
+.fuse_hidden*
+
+# OS cruft
+.DS_Store
+Thumbs.db
