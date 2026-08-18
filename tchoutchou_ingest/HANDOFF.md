@@ -1,8 +1,16 @@
 # TchouTchou — Data Pipeline Handoff
 
-Status as of 2026-08-17. This covers the SNCF data collection pipeline built this
-session: what exists, what's been validated against real data, what's still open, and
-how to pick it up on the VPS.
+Status as of 2026-08-19. This covers the SNCF data collection pipeline: what exists,
+what's been validated against real data, what's still open, and how to pick it up on
+the VPS.
+
+**Current state, in one paragraph**: the collector has been running on the VPS since
+2026-08-17, survived a platform-layer schema migration on 2026-08-18 (see "Migrating an
+existing VPS db" below), and is now on a 5-day raw-retention window due to VPS disk
+constraints (~23GB free as of 2026-08-18). Git is set up and has been pushed to
+multiple times (see "Git" below — no init needed, that step's done). Actively in
+progress: validating the new SIRI upsert logic against real traffic before deciding
+whether to drop its raw_gzip safety net (see "SIRI upsert validation" below).
 
 ## What TchouTchou is
 
@@ -70,6 +78,11 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
 | `aggregate.py` | Folds completed trips from the raw layer into permanent stats. Run daily. |
 | `purge_raw.py` | Deletes raw data already aggregated, past the retention window. Run daily, after aggregate.py. |
 | `extract_entity.py` | Debug tool — rebuilds full entity JSON from a raw snapshot. |
+| `dashboard.html` | Client-side (sql.js, no server) viewer for a `.db` file — Overview + Train Lookup tabs. Open directly in a browser. |
+| `monitor_snapshot.py` | Exports a small (~MB) health-check snapshot of a multi-GB db — row counts, full permanent + platform layers, a sample of the raw layer. Use this to check on the VPS db without transferring the whole file. |
+| `check_raw_blob_share.py` | One-off diagnostic: how many bytes of the db are `snapshots.raw_gzip` blobs vs everything else, broken down by feed. Informs the `--no-raw` decision. |
+| `compare_platform_snapshots.py` | Diffs two `monitor_snapshot.py` exports to catch silent platform-data regressions (a confirmed platform going blank, or recorded→estimated) in the new SIRI upsert logic, plus a spot-check list for manual verification against reality. See "SIRI upsert validation" below. |
+| `cross_validate_train_type.py` | Joins `trip_updates`/`platform_journeys` on train_number+date to cross-check `service_code`-derived `train_type` against SIRI's `line_name`/`product_category_ref` — decodes currently-unmapped codes (`ICN`/`TRN`/`NA`) from real traffic and flags already-mapped codes with inconsistent line_name patterns. |
 | `find_examples.py`, `stats.py`, `peek.py`, `validate_extraction.py` | Ad hoc exploration/validation scripts used during development, not part of the running pipeline. |
 | `getplatform.py`, `testsncf.py` | Original exploration scripts (yours) that the pipeline grew out of. Kept for reference. |
 | `requirements.txt` | `requests`, `gtfs-realtime-bindings` — the only two non-stdlib dependencies. |
@@ -104,6 +117,30 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
     "TER" example suggested.
   - 75% of confirmed (`RecordedCall`) platform observations actually carried a platform
     name — the Confirmed/Likely split is a real signal, not a theoretical one.
+- **`raw_gzip` blob share** (2026-08-19, `check_raw_blob_share.py`): 32.6% of db size
+  (777MB of 2.33GB at the time). Not evenly split across feeds — SIRI's XML blob
+  averages 710 KB/poll vs 118-171 KB/poll for the two GTFS-RT feeds, so SIRI alone is
+  ~71% of all blob bytes despite equal poll counts. Informs the `--no-raw` decision: see
+  "SIRI upsert validation" below for why SIRI's blob is being kept a bit longer than
+  GTFS-RT's despite costing more.
+- **SIRI upsert validation** (ongoing, started 2026-08-19): the 2026-08-18 platform-layer
+  redesign means `platform_calls` no longer keeps poll history — each row is now the
+  *only* record of that stop, so a silent upsert bug (e.g. a stale poll blanking out an
+  already-confirmed platform) would be undetectable without the raw blob. Two checks in
+  progress before deciding to drop SIRI's raw blob:
+  1. `compare_platform_snapshots.py` diffs two `monitor_snapshot.py` exports taken hours
+     apart and flags any confirmed platform that went blank, or any call that reverted
+     recorded→estimated, without a legitimate reassignment. Verified against synthetic
+     fixtures to correctly catch an injected regression and correctly ignore a
+     legitimately-still-confirmed call.
+  2. Manual spot-checks against SNCF Connect/real departure boards. First round
+     (2026-08-19, overnight/thin traffic): 2/2 correct — train UMOL09 (RER A) and
+     164405 (Transilien N) both matched reality. Re-run planned during daytime service
+     for a larger sample.
+  Once this has run clean for a while, drop SIRI's raw blob (bigger win than GTFS-RT's,
+  see blob-share numbers above); keep GTFS-RT's regardless since it still has full poll
+  history in `trip_updates`/`stop_time_updates` and the blob there is a cheaper,
+  lower-stakes safety net.
 
 ## What's NOT done yet
 
@@ -132,24 +169,25 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
 
 ## Git
 
-Repo target: `https://github.com/leachtimothy2403-sketch/TchouTchou.git`
+Repo: `https://github.com/leachtimothy2403-sketch/TchouTchou.git` — **set up and in use**,
+pushed to multiple times since. `.gitignore` at `C:\Users\leach\tchoutchou\.gitignore`
+excludes `*.db`, `*.log`, `__pycache__/`, and the large SNCF static-schedule export.
 
-The repo could **not** be initialized from within this session — the connected Windows
-folder is mounted through a bridge that doesn't support file deletion, and git's
-internal locking needs that. A `.gitignore` was created directly in
-`C:\Users\leach\tchoutchou\.gitignore` (excludes `*.db`, `*.log`, `__pycache__/`, and
-the large SNCF static-schedule export). **You still need to run `git init` yourself**
-on your Windows machine — see the commands from earlier in this conversation, or below.
+Workflow this project has been using: edits happen locally in
+`C:\Users\leach\tchoutchou`, then get committed and pushed **from your Windows
+machine** — there's no way to push from a sandboxed session (no stored GitHub
+credentials, and the mounted-folder bridge can't reliably do git's own locking either).
+After pushing, `git pull` on the VPS to pick it up, and restart the `TchouTchouIngest`
+service only if `ingest.py`/`db.py`/`parse.py`/`siri_parse.py` actually changed —
+standalone scripts (`monitor_snapshot.py`, `check_raw_blob_share.py`,
+`compare_platform_snapshots.py`, doc updates) don't need a restart, the service doesn't
+touch them.
 
 ```powershell
 cd C:\Users\leach\tchoutchou
-Remove-Item -Recurse -Force .git   # clean up the broken partial init, if present
-git init
-git add -A
-git commit -m "Initial commit: TchouTchou SNCF ingestion pipeline"
-git branch -M main
-git remote add origin https://github.com/leachtimothy2403-sketch/TchouTchou.git
-git push -u origin main
+git add <changed files>              # exclude getplatform.py/testsncf.py unless you
+git commit -m "..."                  # actually edited them -- their diffs vs the repo
+git push                             # are just line-ending noise, not real changes
 ```
 
 ## VPS deployment (Windows)
@@ -284,11 +322,20 @@ from the original 90. Revisit upward if/once disk headroom improves (bigger volu
 
 ## Next steps, in order
 
-1. Run the 2-hour VPS test above.
-2. Install the NSSM service and the two scheduled tasks.
-3. Let it run **2-4 weeks minimum** before treating any punctuality number as
+1. Confirm the two Task Scheduler jobs (`TchouTchou Aggregate`, `TchouTchou Purge`) are
+   actually created on the VPS — `schtasks /query /TN "TchouTchou Purge"` to check.
+   These were still manual as of 2026-08-18; without them the 5-day retention window
+   isn't self-enforcing.
+2. Finish the SIRI upsert validation (see above) — run `compare_platform_snapshots.py`
+   against a same-day, higher-traffic pair of exports, and a few more manual spot-checks
+   during daytime service. Once clean, drop SIRI's raw blob (`--no-raw` currently
+   applies to all three feeds uniformly — would need a small `ingest.py` change to scope
+   it to SIRI only, keeping GTFS-RT's cheaper safety net).
+3. Re-check VPS free disk periodically while retention is tight (5 days) — revisit
+   raising it once `--no-raw` (SIRI at least) is live and/or disk headroom improves.
+4. Let it run **2-4 weeks minimum** before treating any punctuality number as
    meaningful — a day or two of data just checks the pipeline survives unattended, it
    doesn't smooth out one-off disruptions (strikes, engineering works, weather).
-4. `git init`/push from your Windows machine (not from this session — see above).
 5. Once there's real history: add the `station_uic` column to the platform tables,
-   cross-validate `product_category_ref`, and consider the delay-propagation table.
+   cross-validate `product_category_ref` (early signal from spot-checks: UMOL09→RER A,
+   164405→Transilien N both look right), and consider the delay-propagation table.
