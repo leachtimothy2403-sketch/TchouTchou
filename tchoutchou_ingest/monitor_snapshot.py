@@ -6,11 +6,14 @@ permanent layer, ingestion_log, and snapshot metadata) without the raw_gzip blob
 millions of raw-layer rows that make the source db multi-gigabyte.
 
 The output is meant to be copied off a VPS quickly for a check-in -- unlike the full db,
-which at multi-GB scale is impractical to transfer. Not a full replica: raw-layer tables
-(trip_updates, stop_time_updates, service_alerts, platform_journeys, platform_calls) are
-sampled (most recent N rows), not copied in full. The permanent layer (trains,
-train_station_stats, train_stats, station_stats, etc.) IS copied in full since it stays
-small even at scale (see README's storage projections).
+which at multi-GB scale is impractical to transfer. Not a full replica: the unbounded
+raw-layer tables (trip_updates, stop_time_updates, service_alerts) are sampled (most
+recent N rows), not copied in full. The permanent layer (trains, train_station_stats,
+train_stats, station_stats, etc.) IS copied in full since it stays small even at scale
+(see README's storage projections). platform_journeys/platform_calls are also copied in
+full -- since the 2026-08-18 redesign they're UPSERTed to final state (one row per
+train_number+calendar_date / per stop, not one row per poll), so they're bounded and
+small like the permanent layer, not unbounded like the other raw tables.
 
 Usage:
     python monitor_snapshot.py --db tchoutchou.db --out tchoutchou_monitor.db
@@ -35,6 +38,13 @@ SMALL_TABLES_FULL = [
     "train_route_variants",
     "platform_variants",
     "platform_lead_time_stats",
+    # platform_journeys/platform_calls: UPSERTed to final state since the 2026-08-18
+    # redesign (one row per train_number+calendar_date / per stop, not per poll) --
+    # bounded and small like the rest of this list, not unbounded like RAW_LAYER_TABLES.
+    # Also: neither table has an `id` column anymore (composite natural PK instead), so
+    # they can't use RAW_LAYER_TABLES' "ORDER BY id DESC LIMIT n" sampling logic anyway.
+    "platform_journeys",
+    "platform_calls",
 ]
 
 # Raw-layer tables that grow unbounded with collection time -- only row count + a
@@ -43,8 +53,6 @@ RAW_LAYER_TABLES = [
     "trip_updates",
     "stop_time_updates",
     "service_alerts",
-    "platform_journeys",
-    "platform_calls",
 ]
 
 DEFAULT_SAMPLE_ROWS = 500

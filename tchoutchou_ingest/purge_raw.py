@@ -9,10 +9,16 @@ aggregate.py first, then this.
 service_alerts aren't part of the aggregation pipeline (see README), so they're purged
 by age alone, independent of aggregation_state.
 
-Also purges the platform layer (platform_journeys, platform_calls) using the same
-"only if already aggregated" rule, gated on platform_aggregation_state instead of
-aggregation_state (SIRI's identity key is train_number+calendar_date, not
-trip_id+start_date -- see db.py and aggregate.py).
+NOTE on the platform layer (platform_journeys, platform_calls): these tables used to be
+append-only raw poll history and were purged here on the same "only if already
+aggregated" schedule. They were redesigned (2026-08-18) to UPSERT to final state instead
+-- one row per (train_number, calendar_date) / per stop, holding only the latest/settled
+value, never per-poll history. There is nothing left to purge: a row already IS the
+compact final answer, not a growing log. So this script no longer touches them at all.
+They stay in the db permanently (small, bounded by trains x days, like the permanent
+layer) until you decide you no longer need a given day's platform detail, at which point
+a simple age-based DELETE on calendar_date would do it -- no aggregation-state gate
+needed since there's no "unaggregated data" risk anymore.
 
 Usage:
     python purge_raw.py --db tchoutchou.db --dry-run           # preview only, deletes nothing
@@ -87,40 +93,8 @@ def main():
     print(f"trip_updates rows eligible for deletion:      {len(tu_ids)}")
     print(f"stop_time_updates rows eligible for deletion:  {stu_count}")
     print(f"service_alerts rows eligible for deletion:     {sa_count}")
-
-    # --- platform_journeys / platform_calls: aggregated + past cutoff (by calendar_date) ---
-    cur.execute(
-        "SELECT COUNT(*) FROM ("
-        "  SELECT DISTINCT pj.train_number, pj.calendar_date FROM platform_journeys pj "
-        "  LEFT JOIN platform_aggregation_state pas "
-        "    ON pas.train_number=pj.train_number AND pas.calendar_date=pj.calendar_date "
-        "  WHERE pj.calendar_date < ? AND pas.train_number IS NULL"
-        ")",
-        (cutoff_date,),
-    )
-    unaggregated_old_platform = cur.fetchone()[0]
-    if unaggregated_old_platform:
-        print(f"WARNING: {unaggregated_old_platform} platform journey(s) older than the retention window "
-              f"have NOT been aggregated yet. Their raw data will be SKIPPED (not deleted) this run.\n")
-
-    cur.execute(
-        "SELECT pj.id FROM platform_journeys pj "
-        "JOIN platform_aggregation_state pas "
-        "  ON pas.train_number=pj.train_number AND pas.calendar_date=pj.calendar_date "
-        "WHERE pj.calendar_date < ?",
-        (cutoff_date,),
-    )
-    pj_ids = [r[0] for r in cur.fetchall()]
-
-    pc_count = 0
-    if pj_ids:
-        for chunk in chunks(pj_ids, 500):
-            placeholders = ",".join("?" for _ in chunk)
-            cur.execute(f"SELECT COUNT(*) FROM platform_calls WHERE platform_journey_id IN ({placeholders})", chunk)
-            pc_count += cur.fetchone()[0]
-
-    print(f"platform_journeys rows eligible for deletion:  {len(pj_ids)}")
-    print(f"platform_calls rows eligible for deletion:     {pc_count}")
+    print("platform_journeys / platform_calls: not purged -- upsert-to-final-state "
+          "tables now, no per-poll history to age out (see module docstring).")
 
     if args.dry_run:
         print("\nDry run -- nothing deleted.")
@@ -144,30 +118,21 @@ def main():
     sa_deleted = cur.rowcount
     conn.commit()
 
-    pc_deleted = 0
-    pj_deleted = 0
-    for chunk in chunks(pj_ids, 500):
-        placeholders = ",".join("?" for _ in chunk)
-        cur.execute(f"DELETE FROM platform_calls WHERE platform_journey_id IN ({placeholders})", chunk)
-        pc_deleted += cur.rowcount
-        cur.execute(f"DELETE FROM platform_journeys WHERE id IN ({placeholders})", chunk)
-        pj_deleted += cur.rowcount
-    conn.commit()
-
-    # --- snapshots: only ones with zero remaining trip_updates/service_alerts/platform_journeys referencing them ---
+    # --- snapshots: only ones with zero remaining trip_updates/service_alerts referencing them.
+    # platform_journeys/platform_calls no longer have a per-row snapshot_id (they're
+    # upserted final-state, not one row per poll) -- first_seen_snapshot_id/
+    # last_seen_snapshot_id are informational only and don't gate snapshot cleanup.
     cur.execute(
         "DELETE FROM snapshots WHERE fetched_at_utc < ? "
         "AND id NOT IN (SELECT DISTINCT snapshot_id FROM trip_updates) "
-        "AND id NOT IN (SELECT DISTINCT snapshot_id FROM service_alerts) "
-        "AND id NOT IN (SELECT DISTINCT snapshot_id FROM platform_journeys)",
+        "AND id NOT IN (SELECT DISTINCT snapshot_id FROM service_alerts)",
         (cutoff_ts,),
     )
     snapshots_deleted = cur.rowcount
     conn.commit()
 
     print(f"\nDeleted: {tu_deleted} trip_updates, {stu_deleted} stop_time_updates, "
-          f"{sa_deleted} service_alerts, {pj_deleted} platform_journeys, {pc_deleted} platform_calls, "
-          f"{snapshots_deleted} snapshots.")
+          f"{sa_deleted} service_alerts, {snapshots_deleted} snapshots.")
 
     if args.vacuum:
         print("Running VACUUM...")

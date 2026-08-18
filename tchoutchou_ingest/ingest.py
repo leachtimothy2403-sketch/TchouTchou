@@ -274,16 +274,54 @@ def poll_siri_feed(conn, feed_name: str, url: str, store_raw: bool):
     )
     snapshot_id = cur.lastrowid
 
+    # UPSERT onto current/final state, not a fresh row per poll -- see db.py's PLATFORM
+    # LAYER comment. Only the current best-known value per (train_number, calendar_date,
+    # stop_point_ref) is kept; *_platform_first_confirmed_at_utc is the one piece of
+    # history preserved (set once, never overwritten), so platform_lead_time_stats stays
+    # computable without needing per-poll snapshots.
     call_count = 0
+    skipped_journeys = 0
     for journey_elem in journeys:
         j = siri_parse.parse_journey(journey_elem)
         calendar_date = siri_parse.calendar_date_from_iso(j["origin_aimed_departure_time"])
+        if not j["train_number"] or not calendar_date:
+            # Can't form the (train_number, calendar_date) identity this schema keys
+            # on -- rare (SIRI almost always includes TrainNumberRef), but skip rather
+            # than crash the whole poll cycle over one malformed journey.
+            skipped_journeys += 1
+            continue
+
+        # A stop can show up as both a RecordedCall and an EstimatedCall in the same
+        # poll response (e.g. arrival confirmed, departure still estimated) --
+        # siri_parse.parse_journey() already orders recorded before estimated per the
+        # "calls[0] per stop" comment there, so keep the first (recorded-preferring)
+        # entry per stop_point_ref and drop the rest, otherwise the second INSERT ...
+        # ON CONFLICT within this same loop would clobber a 'recorded' row with an
+        # 'estimated' one from the very same poll.
+        calls_by_stop = {}
+        for call in j["calls"]:
+            ref = call.get("StopPointRef")
+            if ref and ref not in calls_by_stop:
+                calls_by_stop[ref] = call
+
         cur.execute(
-            "INSERT INTO platform_journeys (snapshot_id, train_number, calendar_date, line_name, "
+            "INSERT INTO platform_journeys (train_number, calendar_date, line_name, "
             "origin_name, destination_name, product_category_ref, origin_aimed_departure_time, "
-            "destination_aimed_arrival_time, call_count) VALUES "
-            "(:snapshot_id, :train_number, :calendar_date, :line_name, :origin_name, :destination_name, "
-            ":product_category_ref, :origin_aimed_departure_time, :destination_aimed_arrival_time, :call_count)",
+            "destination_aimed_arrival_time, call_count, first_seen_snapshot_id, "
+            "last_seen_snapshot_id, last_updated_at_utc) VALUES "
+            "(:train_number, :calendar_date, :line_name, :origin_name, :destination_name, "
+            ":product_category_ref, :origin_aimed_departure_time, :destination_aimed_arrival_time, "
+            ":call_count, :snapshot_id, :snapshot_id, :now) "
+            "ON CONFLICT(train_number, calendar_date) DO UPDATE SET "
+            "line_name=excluded.line_name, "
+            "origin_name=excluded.origin_name, "
+            "destination_name=excluded.destination_name, "
+            "product_category_ref=excluded.product_category_ref, "
+            "origin_aimed_departure_time=excluded.origin_aimed_departure_time, "
+            "destination_aimed_arrival_time=excluded.destination_aimed_arrival_time, "
+            "call_count=excluded.call_count, "
+            "last_seen_snapshot_id=excluded.last_seen_snapshot_id, "
+            "last_updated_at_utc=excluded.last_updated_at_utc",
             {
                 "snapshot_id": snapshot_id,
                 "train_number": j["train_number"],
@@ -294,19 +332,43 @@ def poll_siri_feed(conn, feed_name: str, url: str, store_raw: bool):
                 "product_category_ref": j["product_category_ref"],
                 "origin_aimed_departure_time": j["origin_aimed_departure_time"],
                 "destination_aimed_arrival_time": j["destination_aimed_arrival_time"],
-                "call_count": len(j["calls"]),
+                "call_count": len(calls_by_stop),
+                "now": run_at,
             },
         )
-        platform_journey_id = cur.lastrowid
-        for call in j["calls"]:
+
+        for stop_ref, call in calls_by_stop.items():
+            params = {
+                **call,
+                "train_number": j["train_number"],
+                "calendar_date": calendar_date,
+                "now": run_at,
+            }
             cur.execute(
-                "INSERT INTO platform_calls (platform_journey_id, call_type, stop_point_ref, "
+                "INSERT INTO platform_calls (train_number, calendar_date, stop_point_ref, call_type, "
                 "stop_point_name, aimed_arrival_time, expected_arrival_time, arrival_platform_name, "
-                "aimed_departure_time, expected_departure_time, departure_platform_name) VALUES "
-                "(:platform_journey_id, :call_type, :StopPointRef, :StopPointName, :AimedArrivalTime, "
-                ":ExpectedArrivalTime, :ArrivalPlatformName, :AimedDepartureTime, :ExpectedDepartureTime, "
-                ":DeparturePlatformName)",
-                {**call, "platform_journey_id": platform_journey_id},
+                "arrival_platform_first_confirmed_at_utc, aimed_departure_time, expected_departure_time, "
+                "departure_platform_name, departure_platform_first_confirmed_at_utc, last_updated_at_utc) "
+                "VALUES (:train_number, :calendar_date, :StopPointRef, :call_type, :StopPointName, "
+                ":AimedArrivalTime, :ExpectedArrivalTime, :ArrivalPlatformName, "
+                "CASE WHEN :ArrivalPlatformName IS NOT NULL THEN :now ELSE NULL END, "
+                ":AimedDepartureTime, :ExpectedDepartureTime, :DeparturePlatformName, "
+                "CASE WHEN :DeparturePlatformName IS NOT NULL THEN :now ELSE NULL END, :now) "
+                "ON CONFLICT(train_number, calendar_date, stop_point_ref) DO UPDATE SET "
+                "call_type=excluded.call_type, "
+                "stop_point_name=COALESCE(excluded.stop_point_name, platform_calls.stop_point_name), "
+                "aimed_arrival_time=COALESCE(excluded.aimed_arrival_time, platform_calls.aimed_arrival_time), "
+                "expected_arrival_time=excluded.expected_arrival_time, "
+                "arrival_platform_name=excluded.arrival_platform_name, "
+                "arrival_platform_first_confirmed_at_utc="
+                "  COALESCE(platform_calls.arrival_platform_first_confirmed_at_utc, excluded.arrival_platform_first_confirmed_at_utc), "
+                "aimed_departure_time=COALESCE(excluded.aimed_departure_time, platform_calls.aimed_departure_time), "
+                "expected_departure_time=excluded.expected_departure_time, "
+                "departure_platform_name=excluded.departure_platform_name, "
+                "departure_platform_first_confirmed_at_utc="
+                "  COALESCE(platform_calls.departure_platform_first_confirmed_at_utc, excluded.departure_platform_first_confirmed_at_utc), "
+                "last_updated_at_utc=excluded.last_updated_at_utc",
+                params,
             )
             call_count += 1
 
@@ -318,8 +380,8 @@ def poll_siri_feed(conn, feed_name: str, url: str, store_raw: bool):
     conn.commit()
 
     logger.info(
-        "%-15s journeys=%-4d calls=%-5d (%dms)",
-        feed_name, entity_count, call_count, duration_ms,
+        "%-15s journeys=%-4d calls=%-5d skipped=%-3d (%dms)",
+        feed_name, entity_count, call_count, skipped_journeys, duration_ms,
     )
 
 
@@ -333,6 +395,12 @@ def main():
     parser.add_argument("--once", action="store_true", help="Poll each feed once, then exit")
     parser.add_argument("--duration-hours", type=float, default=None,
                          help="Stop automatically after this many hours (e.g. 48 for the feasibility run)")
+    # DEFERRED (2026-08-18, explicit user decision): don't turn --no-raw on by default
+    # yet, even though it's the single biggest lever left on db size. Keep the raw_gzip
+    # blobs until parsing is fully validated against real data -- they're what let you
+    # re-diagnose a parsing bug (like the stop_sequence one fixed 2026-08-17) after the
+    # fact, without needing to re-collect. Revisit turning this on once parsing has
+    # proven stable for a while and that safety net stops earning its disk cost.
     parser.add_argument("--no-raw", action="store_true",
                          help="Don't store raw gzip blobs (saves disk, but loses the full-fidelity safety net)")
     parser.add_argument("--no-station-lookup", action="store_true",

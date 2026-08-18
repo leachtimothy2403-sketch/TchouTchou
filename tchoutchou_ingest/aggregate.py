@@ -341,22 +341,24 @@ def process_platform_trip(cur, train_number, calendar_date):
     tier) and platform_lead_time_stats ("how far ahead does SNCF usually confirm it")
     tables.
 
-    Only call_type='recorded' observations count as confirmed -- an EstimatedCall's
-    platform (if SIRI ever populates one) is still a guess and would pollute the
-    historical signal. Per stop + call_field (arrival/departure), the LAST recorded
-    snapshot to report a platform wins (mirrors process_trip's "final observation wins"
-    delay resolution); the FIRST snapshot to report a non-null platform is what lead
-    time is measured from.
+    platform_calls now holds only the current/final state per stop, UPSERTed at ingest
+    time rather than one row per poll (see db.py's PLATFORM LAYER comment and
+    ingest.py's poll_siri_feed()) -- so this is a direct read of one row per stop, not a
+    scan over snapshot history the way this function used to work (and the way
+    process_trip()'s GTFS-RT equivalent still does, since that side wasn't changed).
+    The *_platform_first_confirmed_at_utc columns carry the one piece of history lead
+    time needs, captured once at ingest time.
+
+    Only call_type='recorded' counts as confirmed -- an estimated platform (if SIRI
+    ever populates one) is still a guess and would pollute the historical signal.
     """
     now = datetime.now(timezone.utc).isoformat()
 
     cur.execute(
-        "SELECT pc.stop_point_ref, pc.call_type, pc.aimed_arrival_time, pc.arrival_platform_name, "
-        "pc.aimed_departure_time, pc.departure_platform_name, s.fetched_at_utc "
-        "FROM platform_calls pc "
-        "JOIN platform_journeys pj ON pj.id = pc.platform_journey_id "
-        "JOIN snapshots s ON s.id = pj.snapshot_id "
-        "WHERE pj.train_number=? AND pj.calendar_date=? ORDER BY s.fetched_at_utc ASC",
+        "SELECT stop_point_ref, call_type, aimed_arrival_time, arrival_platform_name, "
+        "arrival_platform_first_confirmed_at_utc, aimed_departure_time, departure_platform_name, "
+        "departure_platform_first_confirmed_at_utc "
+        "FROM platform_calls WHERE train_number=? AND calendar_date=?",
         (train_number, calendar_date),
     )
     rows = cur.fetchall()
@@ -368,36 +370,26 @@ def process_platform_trip(cur, train_number, calendar_date):
         )
         return
 
-    # stop_point_ref -> call_field ('arrival'|'departure') -> state
-    stops = {}
-    for stop_ref, call_type, aimed_arr, arr_platform, aimed_dep, dep_platform, fetched_at in rows:
-        for field, aimed_time, platform in (
-            ("arrival", aimed_arr, arr_platform),
-            ("departure", aimed_dep, dep_platform),
+    for (stop_ref, call_type, aimed_arr, arr_platform, arr_confirmed_ts,
+         aimed_dep, dep_platform, dep_confirmed_ts) in rows:
+        for field, aimed_time, platform, confirmed_ts in (
+            ("arrival", aimed_arr, arr_platform, arr_confirmed_ts),
+            ("departure", aimed_dep, dep_platform, dep_confirmed_ts),
         ):
             if aimed_time is None:
                 continue  # this stop doesn't have this call type at all (e.g. no arrival at the origin)
-            st = stops.setdefault(stop_ref, {}).setdefault(
-                field, {"aimed_time": aimed_time, "final_platform": None, "first_confirmed_ts": None}
-            )
-            if call_type == "recorded" and platform:
-                st["final_platform"] = platform  # last (by fetched_at_utc ASC) recorded wins
-                if st["first_confirmed_ts"] is None:
-                    st["first_confirmed_ts"] = fetched_at
 
-    for stop_ref, fields in stops.items():
-        for field, st in fields.items():
-            if st["final_platform"]:
+            if call_type == "recorded" and platform:
                 cur.execute(
                     "INSERT INTO platform_variants (train_number, stop_point_ref, call_field, "
                     "platform_name, observed_count, last_observed_date) VALUES (?, ?, ?, ?, 1, ?) "
                     "ON CONFLICT(train_number, stop_point_ref, call_field, platform_name) DO UPDATE SET "
                     "observed_count = observed_count + 1, last_observed_date = excluded.last_observed_date",
-                    (train_number, stop_ref, field, st["final_platform"], calendar_date),
+                    (train_number, stop_ref, field, platform, calendar_date),
                 )
 
-                aimed_dt = _parse_iso(st["aimed_time"])
-                confirmed_dt = _parse_iso(st["first_confirmed_ts"])
+                aimed_dt = _parse_iso(aimed_time)
+                confirmed_dt = _parse_iso(confirmed_ts)
                 lead_time_seconds = None
                 if aimed_dt is not None and confirmed_dt is not None:
                     lead_time_seconds = (aimed_dt - confirmed_dt).total_seconds()

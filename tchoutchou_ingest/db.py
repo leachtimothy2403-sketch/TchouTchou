@@ -15,11 +15,15 @@ Two-layer design:
   into the permanent layer, so aggregate.py is idempotent and purge_raw.py knows what's
   safe to delete.
 - PLATFORM LAYER (platform_journeys, platform_calls, platform_variants,
-  platform_lead_time_stats, platform_aggregation_state): a parallel raw+permanent
-  pipeline for the SIRI ET Lite feed (XML, separate protocol from GTFS-RT), which
-  carries SNCF's actual confirmed platform assignments. Identity key is
-  (train_number, calendar_date) instead of (trip_id, start_date) since SIRI has no
-  trip_id. See the "PLATFORM LAYER" section below and siri_parse.py.
+  platform_lead_time_stats, platform_aggregation_state): a parallel pipeline for the
+  SIRI ET Lite feed (XML, separate protocol from GTFS-RT), which carries SNCF's actual
+  confirmed platform assignments. Identity key is (train_number, calendar_date) instead
+  of (trip_id, start_date) since SIRI has no trip_id. Unlike the GTFS-RT raw layer,
+  platform_journeys/platform_calls are NOT append-only history -- they're UPSERTed to
+  just the current/final state per stop, since that's all the product needs (the
+  platform is only displayed ~15 min ahead of arrival anyway) and per-poll history here
+  was the single biggest thing in the db for no real benefit. See the "PLATFORM LAYER"
+  section below and siri_parse.py.
 
 SQLite + WAL mode is enough for a single-writer collector run over days/weeks. Migrate
 to Postgres/TimescaleDB once you're past feasibility and want concurrent readers or
@@ -260,44 +264,65 @@ CREATE TABLE IF NOT EXISTS station_stats (
 -- actual confirmed platform (ArrivalPlatformName/DeparturePlatformName) -- data
 -- GTFS-RT never has at all. RecordedCall = confirmed ("Confirmed"), EstimatedCall =
 -- not yet confirmed ("Likely" once cross-referenced against platform_variants below).
--- Reuses the existing snapshots table (feed_name='siri_et') for the raw_gzip
--- safety net, same as the GTFS-RT feeds.
+--
+-- UPSERT, not append-only, unlike the GTFS-RT raw layer above. Originally this was
+-- one fresh row per journey/call per poll (same shape as trip_updates), but that's
+-- what made platform_calls the single largest table in the db by a wide margin --
+-- 13M+ rows from a day of 2-minute polling, almost all of it redundant restatements
+-- of the same not-yet-final estimate. The product only ever needs the CURRENT/final
+-- platform per stop (it's displayed at the station ~15 min ahead of arrival anyway,
+-- see conversation 2026-08-18) -- there's no use for "what did we predict 40 minutes
+-- ago and then again 38 minutes ago". So each poll now UPSERTs onto one row per
+-- (train_number, calendar_date) / (..., stop_point_ref) instead of inserting a new
+-- one, which keeps this table's size bounded by how many trains×stops actually run,
+-- not by how many times they were polled. The one thing that DOES need a history
+-- point, not just current state, is "how far ahead of arrival does SNCF actually
+-- confirm the platform" (platform_lead_time_stats below) -- so the first moment a
+-- platform goes non-NULL is captured once, in *_platform_first_confirmed_at_utc, and
+-- never overwritten after that.
 -- ============================================================================
 
--- One row per EstimatedVehicleJourney per snapshot -- the SIRI analogue of trip_updates.
+-- One row per (train_number, calendar_date), continuously updated as newer polls
+-- come in -- the SIRI analogue of trip_updates, but current-state instead of
+-- one-row-per-poll (see note above).
 CREATE TABLE IF NOT EXISTS platform_journeys (
-    id                              INTEGER PRIMARY KEY AUTOINCREMENT,
-    snapshot_id                     INTEGER NOT NULL REFERENCES snapshots(id),
-    train_number                    TEXT,           -- TrainNumberRef -- joinable to trip_updates.commercial_train_number
-    calendar_date                   TEXT,           -- derived from origin_aimed_departure_time, see siri_parse.calendar_date_from_iso -- best-effort, not a true SIRI field
+    train_number                    TEXT NOT NULL,  -- TrainNumberRef -- joinable to trip_updates.commercial_train_number
+    calendar_date                   TEXT NOT NULL,  -- derived from origin_aimed_departure_time, see siri_parse.calendar_date_from_iso -- best-effort, not a true SIRI field
     line_name                       TEXT,           -- PublishedLineName
     origin_name                     TEXT,
     destination_name                TEXT,
     product_category_ref            TEXT,           -- second, independent train-type signal -- not yet cross-validated against parse.py's service_code
     origin_aimed_departure_time     TEXT,
     destination_aimed_arrival_time  TEXT,
-    call_count                      INTEGER
+    call_count                      INTEGER,
+    first_seen_snapshot_id          INTEGER REFERENCES snapshots(id),   -- which poll first reported this journey
+    last_seen_snapshot_id           INTEGER REFERENCES snapshots(id),   -- most recent poll that still reported it
+    last_updated_at_utc             TEXT NOT NULL,
+    PRIMARY KEY (train_number, calendar_date)
 );
-CREATE INDEX IF NOT EXISTS idx_pj_train ON platform_journeys(train_number, calendar_date);
-CREATE INDEX IF NOT EXISTS idx_pj_snapshot ON platform_journeys(snapshot_id);
 
--- One row per RecordedCall/EstimatedCall per platform_journey -- the SIRI analogue of
--- stop_time_updates. call_type captures the Confirmed ('recorded') vs Likely-pending
--- ('estimated') distinction directly, rather than inferring it.
+-- One row per (train_number, calendar_date, stop_point_ref) -- the current/final call
+-- info for that stop, continuously updated. call_type reflects the LATEST status seen
+-- (Confirmed once a RecordedCall shows up, Likely/'estimated' until then); the
+-- *_platform_first_confirmed_at_utc columns are the one piece of history kept, for
+-- platform_lead_time_stats.
 CREATE TABLE IF NOT EXISTS platform_calls (
-    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform_journey_id         INTEGER NOT NULL REFERENCES platform_journeys(id),
-    call_type                   TEXT NOT NULL,      -- 'recorded' | 'estimated'
-    stop_point_ref               TEXT,               -- SIRI's own stop identifier, e.g. "StopPoint:OCETrain-87481002" -- not yet mapped to stations.codes_uic
-    stop_point_name              TEXT,
-    aimed_arrival_time            TEXT,
-    expected_arrival_time         TEXT,
-    arrival_platform_name         TEXT,               -- NULL until SNCF announces it
-    aimed_departure_time          TEXT,
-    expected_departure_time       TEXT,
-    departure_platform_name       TEXT
+    train_number                              TEXT NOT NULL,
+    calendar_date                             TEXT NOT NULL,
+    stop_point_ref                            TEXT NOT NULL,  -- SIRI's own stop identifier, e.g. "StopPoint:OCETrain-87481002" -- not yet mapped to stations.codes_uic
+    call_type                                 TEXT NOT NULL,  -- 'recorded' | 'estimated' -- current status, can flip estimated->recorded across polls
+    stop_point_name                           TEXT,
+    aimed_arrival_time                        TEXT,
+    expected_arrival_time                     TEXT,
+    arrival_platform_name                     TEXT,           -- NULL until SNCF announces it
+    arrival_platform_first_confirmed_at_utc   TEXT,           -- set once, first poll where arrival_platform_name went non-NULL; never overwritten after
+    aimed_departure_time                      TEXT,
+    expected_departure_time                   TEXT,
+    departure_platform_name                   TEXT,
+    departure_platform_first_confirmed_at_utc TEXT,           -- same idea, for departure
+    last_updated_at_utc                       TEXT NOT NULL,
+    PRIMARY KEY (train_number, calendar_date, stop_point_ref)
 );
-CREATE INDEX IF NOT EXISTS idx_pc_journey ON platform_calls(platform_journey_id);
 CREATE INDEX IF NOT EXISTS idx_pc_stop ON platform_calls(stop_point_ref);
 
 -- Which (train_number, calendar_date) journeys have already been folded into the
@@ -329,9 +354,10 @@ CREATE INDEX IF NOT EXISTS idx_pv_lookup ON platform_variants(train_number, stop
 
 -- How far ahead of the aimed time SNCF actually announces the platform, per
 -- (train_number, stop_point_ref, call_field) -- running sums, same pattern as the
--- delay stats tables. lead_time_seconds = aimed_time - first_seen_confirmed_time,
--- computed once per journey in aggregate.py (first snapshot where that platform
--- field went from NULL to non-NULL).
+-- delay stats tables. lead_time_seconds = aimed_time - first_seen_confirmed_time.
+-- The "first_seen_confirmed_time" half of that is captured at INGEST time now (see
+-- platform_calls.*_platform_first_confirmed_at_utc above), not by scanning snapshot
+-- history in aggregate.py -- aggregate.py just reads that column directly.
 CREATE TABLE IF NOT EXISTS platform_lead_time_stats (
     train_number             TEXT NOT NULL,
     stop_point_ref             TEXT NOT NULL,

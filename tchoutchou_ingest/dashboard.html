@@ -566,13 +566,16 @@ function buildDashboard(db, fileName, fileSize) {
 
     html += `<div class="section-title">SIRI ET Lite — confirmed platform assignments</div>`;
     html += cardsRow([
-      card(fmtInt(pjStats.n), "Journeys observed"),
+      card(fmtInt(pjStats.n), "Journeys tracked", "current state, not cumulative polls -- see note below"),
       card(fmtInt(pjStats.trains), "Distinct train numbers"),
-      card(fmtInt(totalCalls), "Platform calls observed"),
-      card(pct(totalWithPlatform, totalCalls), "Calls with a named platform"),
+      card(fmtInt(totalCalls), "Stops tracked"),
+      card(pct(totalWithPlatform, totalCalls), "Currently have a named platform"),
     ]);
+    html += `<div class="note">platform_journeys/platform_calls store only the current/final state per stop
+      (UPSERTed as polls come in), not one row per poll -- so these numbers are a live snapshot,
+      not a cumulative count across the collection period. See db.py's PLATFORM LAYER comment.</div>`;
     html += `<div class="two-col">`;
-    html += panel("Confirmed vs likely calls", "'recorded' = SNCF-confirmed, 'estimated' = not yet confirmed", tableFrom(
+    html += panel("Confirmed vs likely, right now", "'recorded' = SNCF has confirmed; 'estimated' = not yet -- current status per stop, not a historical tally", tableFrom(
       pcStats.map(r => ({ call_type: r.call_type, n: r.n, rate: pct(r.with_platform, r.n) })),
       [["call_type","Call type"],["n","Count","num"],["rate","Has platform","num"]]
     ));
@@ -765,12 +768,15 @@ function renderTrainResult(db, trainNumberRaw) {
      WHERE tu.commercial_train_number = ?
      ORDER BY tu.snapshot_id DESC`, [trainNumber]) : [];
 
+  // platform_journeys is one row per (train_number, calendar_date) now -- current/final
+  // state, UPSERTed as polls come in, not one row per poll (see db.py's PLATFORM LAYER
+  // comment) -- so "latest" here means "most recently serviced day", not "most recent poll".
   const pjRows = tableExists(db, "platform_journeys") ? queryRows(db,
-    `SELECT pj.id, pj.snapshot_id, pj.calendar_date, pj.line_name, pj.origin_name, pj.destination_name,
-            pj.product_category_ref, pj.origin_aimed_departure_time, pj.destination_aimed_arrival_time,
-            pj.call_count
-     FROM platform_journeys pj WHERE pj.train_number = ?
-     ORDER BY pj.snapshot_id DESC`, [trainNumber]) : [];
+    `SELECT train_number, calendar_date, line_name, origin_name, destination_name,
+            product_category_ref, origin_aimed_departure_time, destination_aimed_arrival_time,
+            call_count, last_updated_at_utc
+     FROM platform_journeys WHERE train_number = ?
+     ORDER BY calendar_date DESC`, [trainNumber]) : [];
 
   if (!tuRows.length && !pjRows.length) {
     // Exact match failed. Before giving up, look for train numbers that merely CONTAIN
@@ -859,8 +865,8 @@ function renderTrainResult(db, trainNumberRaw) {
   if (!finalDelayInfo && pjRows.length) {
     const calls = queryRows(db,
       `SELECT stop_point_name, call_type, aimed_arrival_time, expected_arrival_time, aimed_departure_time, expected_departure_time
-       FROM platform_calls WHERE platform_journey_id = ?
-       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time) DESC LIMIT 1`, [pjRows[0].id]);
+       FROM platform_calls WHERE train_number = ? AND calendar_date = ?
+       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time) DESC LIMIT 1`, [trainNumber, pjRows[0].calendar_date]);
     if (calls.length) {
       const c = calls[0];
       const aimed = c.aimed_arrival_time || c.aimed_departure_time;
@@ -877,7 +883,7 @@ function renderTrainResult(db, trainNumberRaw) {
 
   html += cardsRow([
     card(fmtInt(tuRows.length), "GTFS-RT polls observed"),
-    card(fmtInt(pjRows.length), "SIRI polls observed"),
+    card(fmtInt(pjRows.length), "SIRI service days tracked"),
     card(fmtInt(distinctTrips || distinctDays), "Distinct trips/days seen"),
     card(finalDelayInfo ? fmtDelaySec(finalDelayInfo.delay) : "—", "Delay at final stop",
       finalDelayInfo
@@ -941,8 +947,8 @@ function renderTrainResult(db, trainNumberRaw) {
     const calls = queryRows(db,
       `SELECT call_type, stop_point_name, aimed_arrival_time, aimed_departure_time,
               arrival_platform_name, departure_platform_name
-       FROM platform_calls WHERE platform_journey_id = ?
-       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time)`, [latest.id]);
+       FROM platform_calls WHERE train_number = ? AND calendar_date = ?
+       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time)`, [trainNumber, latest.calendar_date]);
     if (calls.length) {
       html += panel(`Stop sequence — ${esc(latest.calendar_date || "latest observed run")}`,
         "From the SIRI feed's most recently observed journey for this train. 'Confirmed' = SNCF has announced the platform; 'Likely' = not yet confirmed.",
@@ -1052,15 +1058,18 @@ function renderTrainResult(db, trainNumberRaw) {
     }
 
     if (pjRows.length) {
+      // platform_calls has train_number directly now (natural key), no join needed.
+      // call_type here is each stop's CURRENT status, not a historical tally of polls.
       const pcStats = queryRows(db,
         `SELECT pc.call_type, COUNT(*) as n,
                 SUM(CASE WHEN pc.arrival_platform_name IS NOT NULL OR pc.departure_platform_name IS NOT NULL THEN 1 ELSE 0 END) as with_platform
-         FROM platform_calls pc JOIN platform_journeys pj ON pj.id = pc.platform_journey_id
-         WHERE pj.train_number = ? GROUP BY pc.call_type`, [trainNumber]);
+         FROM platform_calls pc
+         WHERE pc.train_number = ? GROUP BY pc.call_type`, [trainNumber]);
       if (pcStats.length) {
-        html += panel("Platform confirmation (live proxy)", "'recorded' = SNCF already confirmed; 'estimated' = not yet.",
+        html += panel("Platform confirmation (live proxy)",
+          "Current status of each tracked stop, right now — 'recorded' = SNCF has confirmed the platform; 'estimated' = not yet.",
           tableFrom(pcStats.map(r => ({ call_type: r.call_type, n: r.n, rate: pct(r.with_platform, r.n) })),
-            [["call_type", "Call type"], ["n", "Calls", "num"], ["rate", "Has platform", "num"]]));
+            [["call_type", "Call type"], ["n", "Stops", "num"], ["rate", "Has platform", "num"]]));
       }
     }
   }
