@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TchouTchou — Ingestion Dashboard</title>
+<!-- All three libraries are vendored locally in ./vendor -- no CDN, no network dependency,
+     works fully offline whether this file is opened directly (file://) or served. -->
+<script src="vendor/sql-asm.js" onerror="window.__vendorLoadError='vendor/sql-asm.js'"></script>
+<script src="vendor/chart.umd.min.js" onerror="window.__vendorLoadError='vendor/chart.umd.min.js'"></script>
+<script src="vendor/chartjs-adapter-date-fns.bundle.min.js" onerror="window.__vendorLoadError='vendor/chartjs-adapter-date-fns.bundle.min.js'"></script>
+<!-- Station name lookup, generated from SNCF's static GTFS export (stops.txt) already
+     sitting in this folder -- lets GTFS-RT's raw stop_id resolve to a real station name
+     (e.g. "Chamelet") instead of "StopArea:OCE87721829". Optional: if this fails to load,
+     the dashboard falls back to showing raw stop_ids, it doesn't break anything else. -->
+<script src="vendor/stops.js" onerror="window.__stopsLoadFailed=true"></script>
+<style>
+  :root {
+    --blue: #0a3d62;
+    --blue-light: #1e6fa8;
+    --accent: #e8590c;
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --border: #dde3e8;
+    --text: #1c2b36;
+    --muted: #64707a;
+    --ok: #2f9e44;
+    --err: #e03131;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    background: var(--blue);
+    color: #fff;
+    padding: 20px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+  }
+  header p {
+    margin: 4px 0 0;
+    font-size: 13px;
+    color: #cfe0ee;
+  }
+  .picker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .picker label {
+    background: var(--accent);
+    color: #fff;
+    padding: 9px 16px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .picker label:hover { background: #d14e0a; }
+  .picker input[type=file] { display: none; }
+  .picker .fname {
+    font-size: 13px;
+    color: #cfe0ee;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 24px 20px 60px;
+  }
+  .empty-state {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--muted);
+  }
+  .empty-state h2 { color: var(--text); font-size: 18px; margin-bottom: 8px; }
+  .section-title {
+    font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--blue-light);
+    margin: 32px 0 12px;
+  }
+  .section-title:first-child { margin-top: 0; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card .value {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--blue);
+    line-height: 1.2;
+  }
+  .card .label {
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .card .sub {
+    font-size: 11.5px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .panel h3 {
+    margin: 0 0 4px;
+    font-size: 15px;
+  }
+  .panel .desc {
+    font-size: 12.5px;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  .two-col {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 800px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .pill.ok { background: #ebfbee; color: var(--ok); }
+  .pill.err { background: #fff5f5; color: var(--err); }
+  canvas { max-height: 240px; }
+  .note {
+    font-size: 12.5px;
+    color: var(--muted);
+    background: #f0f4f7;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .loading, .error-msg {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+  }
+  .error-msg { color: var(--err); }
+  footer {
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--muted);
+    padding: 20px;
+  }
+
+  .tabs {
+    background: #fff;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 4px;
+    padding: 0 20px;
+    max-width: 1180px;
+    margin: 0 auto;
+  }
+  .tab-btn {
+    border: none;
+    background: none;
+    padding: 14px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--muted);
+    cursor: pointer;
+    border-bottom: 3px solid transparent;
+    font-family: inherit;
+  }
+  .tab-btn:hover { color: var(--blue); }
+  .tab-btn.active { color: var(--blue); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .search-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .search-row input[type=text] {
+    flex: 1;
+    min-width: 200px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .search-row button {
+    background: var(--blue);
+    color: #fff;
+    border: none;
+    padding: 10px 22px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .search-row button:hover { background: var(--blue-light); }
+
+  .train-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+  .train-number {
+    font-size: 32px;
+    font-weight: 800;
+    color: var(--blue);
+    letter-spacing: 0.5px;
+  }
+  .train-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill.type { background: #e7f1fb; color: var(--blue-light); }
+  .pill.op { background: #fef3e7; color: var(--accent); }
+  .pill.line { background: #f1eefc; color: #7048e8; }
+
+  .suggest-list { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .suggest-btn {
+    background: #fff;
+    border: 1px solid var(--blue-light);
+    color: var(--blue-light);
+    border-radius: 20px;
+    padding: 3px 12px;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .suggest-btn:hover { background: var(--blue-light); color: #fff; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>TchouTchou — Ingestion Dashboard</h1>
+    <p id="dbMeta">No database loaded yet</p>
+  </div>
+  <div class="picker">
+    <span class="fname" id="fname"></span>
+    <label for="fileInput">Load .db file</label>
+    <input type="file" id="fileInput" accept=".db,.sqlite,.sqlite3">
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="overviewTab" type="button">Overview</button>
+  <button class="tab-btn" data-tab="trainTab" type="button">Train Lookup</button>
+</nav>
+
+<main>
+  <div id="overviewTab" class="tab-panel active">
+    <div id="main">
+      <div class="empty-state" id="emptyState">
+        <h2>Load a TchouTchou SQLite database to see the dashboard</h2>
+        <p>Point it at <code>tchoutchou.db</code> (or any db produced by <code>ingest.py</code>) —<br>
+          everything runs locally in your browser, the file never leaves your machine.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="trainTab" class="tab-panel">
+    <div class="empty-state" id="trainEmptyState">
+      <h2>Load a database first</h2>
+      <p>Switch to the Overview tab and load a .db file — then come back here to look up a train.</p>
+    </div>
+    <div id="trainContent" style="display:none">
+      <div class="panel">
+        <h3>Search by train number</h3>
+        <p class="desc">Commercial train number as reported by SNCF's feeds (e.g. 8461, 6113) — not the line name.</p>
+        <div class="search-row">
+          <input type="text" id="trainInput" list="trainList" placeholder="Train number…" autocomplete="off" inputmode="numeric">
+          <datalist id="trainList"></datalist>
+          <button id="trainSearchBtn" type="button">Search</button>
+        </div>
+        <div class="note" id="trainCountNote" style="margin-top:12px"></div>
+      </div>
+      <div id="trainResults"></div>
+    </div>
+  </div>
+</main>
+
+<footer>Reads tchoutchou.db entirely client-side via sql.js. No data is uploaded anywhere.</footer>
+
+<script>
+let SQL = null;
+let charts = [];
+let currentDb = null;
+
+function fmtInt(n) {
+  if (n === null || n === undefined) return "—";
+  return Number(n).toLocaleString("en-US");
+}
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const units = ["B","KB","MB","GB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 1 : 0) + " " + units[i];
+}
+function fmtMs(n) {
+  if (n === null || n === undefined) return "—";
+  return Math.round(n) + " ms";
+}
+function fmtDur(startIso, endIso) {
+  if (!startIso || !endIso) return "—";
+  const ms = new Date(endIso) - new Date(startIso);
+  if (isNaN(ms) || ms < 0) return "—";
+  const mins = ms / 60000;
+  if (mins < 60) return mins.toFixed(1) + " min";
+  return (mins / 60).toFixed(1) + " h";
+}
+function pct(n, d) {
+  if (!d) return "—";
+  return ((n / d) * 100).toFixed(1) + "%";
+}
+function fmtClock(iso) {
+  if (!iso) return "—";
+  const s = String(iso);
+  const idx = s.indexOf("T");
+  if (idx === -1) return s.slice(0, 5);
+  return s.slice(idx + 1, idx + 6);
+}
+function fmtDelaySec(s) {
+  if (s === null || s === undefined || isNaN(s)) return "—";
+  const sign = s < 0 ? "−" : "+";
+  const abs = Math.abs(Math.round(s));
+  const m = Math.floor(abs / 60), sec = abs % 60;
+  return `${sign}${m}m${sec ? " " + sec + "s" : ""}`;
+}
+// GTFS-RT stop_time_updates.arrival_time/departure_time are unix epoch seconds (the
+// predicted absolute time), not offsets -- format them as French wall-clock time
+// regardless of the viewer's own timezone, since these are French trains.
+function fmtEpochParis(sec) {
+  if (sec === null || sec === undefined || isNaN(sec)) return "—";
+  try {
+    return new Date(sec * 1000).toLocaleTimeString("fr-FR", { timeZone: "Europe/Paris", hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return "—"; }
+}
+// GTFS-RT's stop_id (e.g. "StopArea:OCE87721829") isn't resolved anywhere else in this
+// pipeline -- ingest.py only ever looks up origin/destination UIC codes, never
+// intermediate stops. vendor/stops.js (generated from the static GTFS stops.txt already
+// in this folder) gives a direct stop_id -> name lookup, verified as a 100% match against
+// every distinct stop_id actually seen in a real collection run. Falls back to the raw
+// stop_id if vendor/stops.js didn't load or a particular id isn't in it.
+function gtfsStopName(stopId) {
+  if (!stopId) return "?";
+  if (window.STOP_NAMES && window.STOP_NAMES[stopId]) return window.STOP_NAMES[stopId];
+  const m = String(stopId).match(/(\d{7,8})$/);
+  if (m && window.STOP_NAMES_BY_UIC && window.STOP_NAMES_BY_UIC[m[1]]) return window.STOP_NAMES_BY_UIC[m[1]];
+  return stopId;
+}
+function mostCommon(rows, field) {
+  const counts = {};
+  rows.forEach(r => { const v = r[field]; if (v) counts[v] = (counts[v] || 0) + 1; });
+  let best = null, bestN = 0;
+  for (const k in counts) if (counts[k] > bestN) { best = k; bestN = counts[k]; }
+  return best;
+}
+function groupCount(rows, keys) {
+  const map = new Map();
+  rows.forEach(r => {
+    const k = keys.map(f => r[f]).join("||");
+    if (!map.has(k)) {
+      const base = {};
+      keys.forEach(f => base[f] = r[f]);
+      base.n = 0;
+      map.set(k, base);
+    }
+    map.get(k).n++;
+  });
+  return Array.from(map.values()).sort((a, b) => b.n - a.n);
+}
+const _stationNameCache = new Map();
+function stationName(db, uic) {
+  if (!uic) return null;
+  if (_stationNameCache.has(uic)) return _stationNameCache.get(uic);
+  let name = null;
+  if (tableExists(db, "stations")) {
+    const rows = queryRows(db, `SELECT nom FROM stations WHERE codes_uic = ?`, [uic]);
+    if (rows.length && rows[0].nom) name = rows[0].nom;
+  }
+  // fall back to the static GTFS export's UIC -> name map (vendor/stops.js) when this
+  // UIC was never looked up live (stations.py only resolves UICs it actually sees as an
+  // origin/destination, so plenty of stations never make it into the `stations` table).
+  if (!name && window.STOP_NAMES_BY_UIC && window.STOP_NAMES_BY_UIC[uic]) {
+    name = window.STOP_NAMES_BY_UIC[uic];
+  }
+  if (!name) name = uic;
+  _stationNameCache.set(uic, name);
+  return name;
+}
+function esc(s) {
+  if (s === null || s === undefined) return "";
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function tableExists(db, name) {
+  const res = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", [name]);
+  return res.length > 0 && res[0].values.length > 0;
+}
+function rowCount(db, table) {
+  if (!tableExists(db, table)) return 0;
+  const res = db.exec(`SELECT COUNT(*) FROM ${table}`);
+  return res[0].values[0][0];
+}
+function queryAll(db, sql, params) {
+  if (!db) return { columns: [], values: [] };
+  const res = db.exec(sql, params || []);
+  return res.length ? res[0] : { columns: [], values: [] };
+}
+function queryRows(db, sql, params) {
+  const r = queryAll(db, sql, params);
+  return r.values.map(row => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
+}
+function destroyCharts() {
+  charts.forEach(c => c.destroy());
+  charts = [];
+}
+
+function buildDashboard(db, fileName, fileSize) {
+  destroyCharts();
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+
+  // ---- Overview ----
+  const snapCount = rowCount(db, "snapshots");
+  const feedRows = queryRows(db,
+    `SELECT feed_name, COUNT(*) as polls, MIN(fetched_at_utc) as first_at, MAX(fetched_at_utc) as last_at,
+            SUM(content_length_bytes) as bytes, AVG(fetch_duration_ms) as avg_ms, SUM(entity_count) as total_entities
+     FROM snapshots GROUP BY feed_name ORDER BY feed_name`);
+  const logStatus = queryRows(db,
+    `SELECT status, COUNT(*) as n FROM ingestion_log GROUP BY status`);
+  const okCount = (logStatus.find(r => r.status === "ok") || {}).n || 0;
+  const errCount = (logStatus.find(r => r.status === "error") || {}).n || 0;
+  const totalPolls = okCount + errCount;
+  const overallRange = queryRows(db, `SELECT MIN(fetched_at_utc) as a, MAX(fetched_at_utc) as b FROM snapshots`)[0] || {};
+  const totalBytes = feedRows.reduce((s, r) => s + (r.bytes || 0), 0);
+
+  document.getElementById("dbMeta").textContent =
+    `${fileName} • ${fmtBytes(fileSize)} on disk • ${snapCount} snapshot${snapCount === 1 ? "" : "s"}`
+    + (overallRange.a ? ` • span ${fmtDur(overallRange.a, overallRange.b)}` : "");
+
+  let html = "";
+
+  html += section("Overview", cardsRow([
+    card(fmtInt(totalPolls), "Total poll attempts", `${fmtInt(okCount)} ok / ${fmtInt(errCount)} error`),
+    card(pct(okCount, totalPolls), "Poll success rate"),
+    card(fmtInt(snapCount), "Snapshots stored"),
+    card(fmtBytes(totalBytes), "Raw payload volume"),
+    card(fmtDur(overallRange.a, overallRange.b), "Collection span", overallRange.a ? `${overallRange.a.slice(0,19).replace("T"," ")} UTC → ${overallRange.b.slice(0,19).replace("T"," ")} UTC` : ""),
+  ]));
+
+  html += panel("Feeds polled", "", feedTable(feedRows));
+
+  // ---- Per-feed entity timeline ----
+  if (feedRows.length) {
+    html += `<div class="section-title">Entity volume over time</div>`;
+    html += `<div class="panel"><canvas id="timelineChart"></canvas></div>`;
+  }
+
+  // ---- GTFS-RT trip_updates ----
+  const tuCount = rowCount(db, "trip_updates");
+  if (tuCount > 0) {
+    const tuStats = queryRows(db,
+      `SELECT COUNT(*) as n, COUNT(DISTINCT commercial_train_number) as trains,
+              COUNT(DISTINCT trip_id) as trips, SUM(stop_time_update_count) as stu
+       FROM trip_updates`)[0];
+    const typeBreak = queryRows(db,
+      `SELECT COALESCE(train_type,'(unmapped)') as train_type, COUNT(*) as n
+       FROM trip_updates GROUP BY train_type ORDER BY n DESC LIMIT 12`);
+
+    html += `<div class="section-title">GTFS-RT — trip_updates</div>`;
+    html += cardsRow([
+      card(fmtInt(tuStats.n), "trip_update rows"),
+      card(fmtInt(tuStats.trains), "Distinct train numbers"),
+      card(fmtInt(tuStats.trips), "Distinct trip_ids"),
+      card(fmtInt(tuStats.stu), "stop_time_updates recorded"),
+    ]);
+    html += `<div class="two-col">`;
+    html += panel("Train type breakdown", "By commercial train type, across all polls", `<canvas id="typeChart"></canvas>`);
+    html += panel("Top train types", "", tableFrom(typeBreak, [["train_type","Type"],["n","Rows","num"]]));
+    html += `</div>`;
+  }
+
+  // ---- service_alerts ----
+  const saCount = rowCount(db, "service_alerts");
+  if (saCount > 0) {
+    const effectBreak = queryRows(db,
+      `SELECT COALESCE(effect,'(none)') as effect, COUNT(*) as n
+       FROM service_alerts GROUP BY effect ORDER BY n DESC`);
+    html += `<div class="section-title">GTFS-RT — service_alerts</div>`;
+    html += cardsRow([
+      card(fmtInt(saCount), "Alert rows recorded"),
+      card(fmtInt(effectBreak.length), "Distinct effect types"),
+    ]);
+    html += panel("Alerts by effect", "", tableFrom(effectBreak, [["effect","Effect"],["n","Count","num"]]));
+  }
+
+  // ---- SIRI platform layer ----
+  const pjCount = rowCount(db, "platform_journeys");
+  if (pjCount > 0) {
+    const pjStats = queryRows(db,
+      `SELECT COUNT(*) as n, COUNT(DISTINCT train_number) as trains FROM platform_journeys`)[0];
+    const pcStats = queryRows(db,
+      `SELECT call_type, COUNT(*) as n,
+              SUM(CASE WHEN arrival_platform_name IS NOT NULL OR departure_platform_name IS NOT NULL THEN 1 ELSE 0 END) as with_platform
+       FROM platform_calls GROUP BY call_type`);
+    const totalCalls = pcStats.reduce((s, r) => s + r.n, 0);
+    const totalWithPlatform = pcStats.reduce((s, r) => s + r.with_platform, 0);
+    const catBreak = queryRows(db,
+      `SELECT COALESCE(product_category_ref,'(none)') as cat, COUNT(*) as n
+       FROM platform_journeys GROUP BY product_category_ref ORDER BY n DESC LIMIT 12`);
+
+    html += `<div class="section-title">SIRI ET Lite — confirmed platform assignments</div>`;
+    html += cardsRow([
+      card(fmtInt(pjStats.n), "Journeys observed"),
+      card(fmtInt(pjStats.trains), "Distinct train numbers"),
+      card(fmtInt(totalCalls), "Platform calls observed"),
+      card(pct(totalWithPlatform, totalCalls), "Calls with a named platform"),
+    ]);
+    html += `<div class="two-col">`;
+    html += panel("Confirmed vs likely calls", "'recorded' = SNCF-confirmed, 'estimated' = not yet confirmed", tableFrom(
+      pcStats.map(r => ({ call_type: r.call_type, n: r.n, rate: pct(r.with_platform, r.n) })),
+      [["call_type","Call type"],["n","Count","num"],["rate","Has platform","num"]]
+    ));
+    html += panel("Product category (2nd train-type signal)", "product_category_ref — not yet cross-checked against train_type", tableFrom(catBreak, [["cat","Category"],["n","Count","num"]]));
+    html += `</div>`;
+  }
+
+  // ---- ingestion_log errors ----
+  if (errCount > 0) {
+    const errs = queryRows(db,
+      `SELECT run_at_utc, feed_name, error_message FROM ingestion_log WHERE status='error' ORDER BY run_at_utc DESC LIMIT 20`);
+    html += `<div class="section-title">Poll errors (most recent 20)</div>`;
+    html += panel("", "", tableFrom(errs, [["run_at_utc","When"],["feed_name","Feed"],["error_message","Error"]]));
+  }
+
+  // ---- stations ----
+  const stCount = rowCount(db, "stations");
+  if (stCount > 0) {
+    const stBreak = queryRows(db, `SELECT lookup_status, COUNT(*) as n FROM stations GROUP BY lookup_status`);
+    html += `<div class="section-title">Station name cache</div>`;
+    html += cardsRow([
+      card(fmtInt(stCount), "UIC codes resolved"),
+      ...stBreak.map(r => card(fmtInt(r.n), r.lookup_status === "ok" ? "Resolved OK" : "Not found")),
+    ]);
+  }
+
+  // ---- permanent layer note ----
+  const permTables = ["trains","train_station_stats","train_stats","station_stats","platform_variants","platform_lead_time_stats"];
+  const permCounts = permTables.map(t => rowCount(db, t));
+  const permTotal = permCounts.reduce((a,b) => a+b, 0);
+  html += `<div class="section-title">Permanent (aggregated) layer</div>`;
+  if (permTotal === 0) {
+    html += `<div class="note">Empty, as expected for a short run — <code>aggregate.py</code> only folds trips that are
+      at least a day old into <code>trains</code> / <code>train_station_stats</code> / <code>station_stats</code> / etc.
+      Everything above is raw-layer data from this run alone.</div>`;
+  } else {
+    html += cardsRow(permTables.map((t, i) => card(fmtInt(permCounts[i]), t)));
+  }
+
+  main.innerHTML = html;
+
+  // ---- render charts ----
+  if (feedRows.length) {
+    renderTimelineChart(db, feedRows.map(r => r.feed_name));
+  }
+  if (tuCount > 0) {
+    const typeBreak = queryRows(db,
+      `SELECT COALESCE(train_type,'(unmapped)') as train_type, COUNT(*) as n
+       FROM trip_updates GROUP BY train_type ORDER BY n DESC LIMIT 10`);
+    renderBarChart("typeChart", typeBreak.map(r => r.train_type), typeBreak.map(r => r.n), "Rows");
+  }
+}
+
+function renderTimelineChart(db, feedNames) {
+  const ctx = document.getElementById("timelineChart");
+  if (!ctx) return;
+  const palette = ["#0a3d62", "#e8590c", "#2f9e44", "#7048e8", "#1e6fa8"];
+  const datasets = feedNames.map((feed, i) => {
+    const rows = queryRows(db,
+      `SELECT fetched_at_utc, entity_count FROM snapshots WHERE feed_name=? ORDER BY fetched_at_utc`, [feed]);
+    return {
+      label: feed,
+      data: rows.map(r => ({ x: new Date(r.fetched_at_utc), y: r.entity_count })),
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length],
+      tension: 0.2,
+      pointRadius: 2,
+    };
+  });
+  charts.push(new Chart(ctx, {
+    type: "line",
+    data: { datasets },
+    options: {
+      responsive: true,
+      parsing: false,
+      scales: {
+        x: { type: "time", time: { unit: "minute" }, ticks: { maxRotation: 0 } },
+        y: { title: { display: true, text: "entities per poll" }, beginAtZero: true },
+      },
+      plugins: { legend: { position: "bottom" } },
+    },
+  }));
+}
+
+function renderBarChart(id, labels, values, label) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  charts.push(new Chart(ctx, {
+    type: "bar",
+    data: { labels, datasets: [{ label, data: values, backgroundColor: "#1e6fa8" }] },
+    options: {
+      responsive: true,
+      indexAxis: "y",
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true } },
+    },
+  }));
+}
+
+function section(title, body) {
+  return `<div class="section-title">${esc(title)}</div>${body}`;
+}
+function panel(title, desc, body) {
+  return `<div class="panel">${title ? `<h3>${esc(title)}</h3>` : ""}${desc ? `<p class="desc">${esc(desc)}</p>` : ""}${body}</div>`;
+}
+function cardsRow(cardsHtml) {
+  return `<div class="cards">${cardsHtml.join("")}</div>`;
+}
+function card(value, label, sub) {
+  return `<div class="card"><div class="value">${value}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
+}
+function feedTable(rows) {
+  let out = `<table><thead><tr><th>Feed</th><th class="num">Polls</th><th>First poll (UTC)</th><th>Last poll (UTC)</th><th class="num">Total entities</th><th class="num">Avg latency</th><th class="num">Payload</th></tr></thead><tbody>`;
+  rows.forEach(r => {
+    out += `<tr><td>${esc(r.feed_name)}</td><td class="num">${fmtInt(r.polls)}</td>` +
+      `<td>${esc((r.first_at||"").slice(0,19).replace("T"," "))}</td>` +
+      `<td>${esc((r.last_at||"").slice(0,19).replace("T"," "))}</td>` +
+      `<td class="num">${fmtInt(r.total_entities)}</td><td class="num">${fmtMs(r.avg_ms)}</td>` +
+      `<td class="num">${fmtBytes(r.bytes)}</td></tr>`;
+  });
+  out += `</tbody></table>`;
+  return out;
+}
+function tableFrom(rows, cols) {
+  if (!rows.length) return `<div class="note">No rows.</div>`;
+  let out = `<table><thead><tr>` + cols.map(c => `<th class="${c[2]==='num'?'num':''}">${esc(c[1])}</th>`).join("") + `</tr></thead><tbody>`;
+  rows.forEach(r => {
+    out += `<tr>` + cols.map(c => {
+      const v = r[c[0]];
+      const display = typeof v === "number" ? fmtInt(v) : esc(v);
+      return `<td class="${c[2]==='num'?'num':''}">${display}</td>`;
+    }).join("") + `</tr>`;
+  });
+  out += `</tbody></table>`;
+  return out;
+}
+
+// ============================================================================
+// TRAIN LOOKUP TAB
+// ============================================================================
+
+function buildTrainIndex(db) {
+  const nums = new Set();
+  if (tableExists(db, "trip_updates")) {
+    queryRows(db,
+      `SELECT DISTINCT commercial_train_number as n FROM trip_updates
+       WHERE commercial_train_number IS NOT NULL AND commercial_train_number != ''`
+    ).forEach(r => nums.add(r.n));
+  }
+  if (tableExists(db, "platform_journeys")) {
+    queryRows(db,
+      `SELECT DISTINCT train_number as n FROM platform_journeys
+       WHERE train_number IS NOT NULL AND train_number != ''`
+    ).forEach(r => nums.add(r.n));
+  }
+  const list = Array.from(nums).sort();
+
+  document.getElementById("trainEmptyState").style.display = "none";
+  document.getElementById("trainContent").style.display = "block";
+
+  document.getElementById("trainList").innerHTML =
+    list.slice(0, 3000).map(n => `<option value="${esc(n)}">`).join("");
+
+  const sample = list.slice(0, 3).join(", ");
+  document.getElementById("trainCountNote").textContent = list.length
+    ? `${list.length.toLocaleString("en-US")} distinct train number${list.length === 1 ? "" : "s"} in this file. Try e.g. ${sample}.`
+    : "No train numbers found in trip_updates or platform_journeys in this file.";
+
+  document.getElementById("trainResults").innerHTML = "";
+  document.getElementById("trainInput").value = "";
+}
+
+function resetTrainTab() {
+  document.getElementById("trainEmptyState").style.display = "";
+  document.getElementById("trainContent").style.display = "none";
+  document.getElementById("trainResults").innerHTML = "";
+}
+
+function renderTrainResult(db, trainNumberRaw) {
+  const results = document.getElementById("trainResults");
+  const trainNumber = (trainNumberRaw || "").trim();
+  if (!db) { results.innerHTML = `<div class="note">Load a database first.</div>`; return; }
+  if (!trainNumber) { results.innerHTML = ""; return; }
+
+  const tuRows = tableExists(db, "trip_updates") ? queryRows(db,
+    `SELECT tu.id, tu.snapshot_id, tu.trip_id, tu.start_date, tu.start_time, tu.train_type,
+            tu.service_code, tu.origin_uic, tu.destination_uic, tu.trip_update_delay,
+            tu.vehicle_label, s.fetched_at_utc
+     FROM trip_updates tu JOIN snapshots s ON s.id = tu.snapshot_id
+     WHERE tu.commercial_train_number = ?
+     ORDER BY tu.snapshot_id DESC`, [trainNumber]) : [];
+
+  const pjRows = tableExists(db, "platform_journeys") ? queryRows(db,
+    `SELECT pj.id, pj.snapshot_id, pj.calendar_date, pj.line_name, pj.origin_name, pj.destination_name,
+            pj.product_category_ref, pj.origin_aimed_departure_time, pj.destination_aimed_arrival_time,
+            pj.call_count
+     FROM platform_journeys pj WHERE pj.train_number = ?
+     ORDER BY pj.snapshot_id DESC`, [trainNumber]) : [];
+
+  if (!tuRows.length && !pjRows.length) {
+    // Exact match failed. Before giving up, look for train numbers that merely CONTAIN
+    // the searched digits -- catches the common real-world causes: a digit transposed
+    // from memory, a leading/trailing character SNCF's public-facing number doesn't
+    // carry, or (for bus-replacement services especially) the parsed commercial number
+    // genuinely differing from what's announced. This makes a format mismatch
+    // self-diagnosable instead of a dead end.
+    const like = `%${trainNumber}%`;
+    const fuzzy = new Set();
+    if (trainNumber && tableExists(db, "trip_updates")) {
+      queryRows(db, `SELECT DISTINCT commercial_train_number as n FROM trip_updates WHERE commercial_train_number LIKE ? LIMIT 15`, [like])
+        .forEach(r => fuzzy.add(r.n));
+    }
+    if (trainNumber && tableExists(db, "platform_journeys")) {
+      queryRows(db, `SELECT DISTINCT train_number as n FROM platform_journeys WHERE train_number LIKE ? LIMIT 15`, [like])
+        .forEach(r => fuzzy.add(r.n));
+    }
+    const suggestions = Array.from(fuzzy).slice(0, 12);
+    results.innerHTML = `<div class="note">No exact match for train <strong>${esc(trainNumber)}</strong> in this file.
+      ${suggestions.length
+        ? `Did you mean: <span class="suggest-list">${suggestions.map(n => `<button class="suggest-btn" data-train="${esc(n)}" type="button">${esc(n)}</button>`).join("")}</span>`
+        : `No train number in this file even contains "${esc(trainNumber)}" — it likely wasn't picked up by these feeds during this file's poll window (a 10-minute run only catches whatever happened to be reported in that window), or the exact number differs from what's publicly displayed.`}
+    </div>`;
+    results.querySelectorAll(".suggest-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.getElementById("trainInput").value = btn.dataset.train;
+        renderTrainResult(currentDb, btn.dataset.train);
+      });
+    });
+    return;
+  }
+
+  let html = "";
+
+  // ---- Identity ----
+  const typeGuess = mostCommon(tuRows, "train_type");
+  const catGuess = mostCommon(pjRows, "product_category_ref");
+  const opGuess = mostCommon(tuRows, "service_code");
+  const lineGuess = mostCommon(pjRows, "line_name");
+  const catLabel = catGuess ? catGuess.replace(/^FR:TypeOfProductCategory::/, "").replace(/::$/, "") : null;
+
+  html += `<div class="train-header">
+    <div class="train-number">${esc(trainNumber)}</div>
+    <div class="train-badges">
+      ${typeGuess ? `<span class="pill type">${esc(typeGuess)}</span>` : (catLabel ? `<span class="pill type">${esc(catLabel)}</span>` : "")}
+      ${opGuess ? `<span class="pill op">code ${esc(opGuess)}</span>` : ""}
+      ${lineGuess ? `<span class="pill line">${esc(lineGuess)}</span>` : ""}
+    </div>
+  </div>`;
+
+  const distinctTrips = new Set(tuRows.map(r => `${r.trip_id}|${r.start_date}`)).size;
+  const distinctDays = new Set(pjRows.map(r => r.calendar_date)).size;
+  const lastSeen = tuRows.length ? tuRows[0].fetched_at_utc : null;
+
+  // "Delay at final stop" instead of GTFS-RT's trip-level delay field: delay is
+  // inherently per-stop (SNCF's feed leaves trip_update.delay NULL in practice --
+  // confirmed 0 non-null values across 250k+ real stop_time_updates rows from two
+  // separate collection runs), and the destination's delay is the number that actually
+  // answers "will I arrive late". This is also exactly what the permanent layer's
+  // train_stats.sum_final_delay is defined to be, once aggregate.py runs -- so this
+  // live-proxy card and the real future stat measure the same thing.
+  //
+  // Ordered by arrival_time/departure_time (absolute epoch, always present and
+  // monotonically increasing along the route) rather than stop_sequence -- SNCF's feed
+  // never actually populates stop_sequence (same 0/250k+ finding), so anything that
+  // orders by it (including aggregate.py's own "final stop" selection, see below) picks
+  // an arbitrary stop, not necessarily the last one.
+  let finalDelayInfo = null;
+  if (tuRows.length) {
+    const stops = queryRows(db,
+      `SELECT stop_id, arrival_delay, arrival_time, departure_delay, departure_time
+       FROM stop_time_updates WHERE trip_update_id = ?
+       ORDER BY COALESCE(arrival_time, departure_time) DESC LIMIT 1`, [tuRows[0].id]);
+    if (stops.length) {
+      const s = stops[0];
+      const delay = s.arrival_delay !== null && s.arrival_delay !== undefined ? s.arrival_delay : s.departure_delay;
+      if (delay !== null && delay !== undefined) {
+        finalDelayInfo = {
+          delay, station: gtfsStopName(s.stop_id),
+          time: fmtEpochParis(s.arrival_time !== null && s.arrival_time !== undefined ? s.arrival_time : s.departure_time),
+        };
+      }
+    }
+  }
+  if (!finalDelayInfo && pjRows.length) {
+    const calls = queryRows(db,
+      `SELECT stop_point_name, call_type, aimed_arrival_time, expected_arrival_time, aimed_departure_time, expected_departure_time
+       FROM platform_calls WHERE platform_journey_id = ?
+       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time) DESC LIMIT 1`, [pjRows[0].id]);
+    if (calls.length) {
+      const c = calls[0];
+      const aimed = c.aimed_arrival_time || c.aimed_departure_time;
+      const expected = c.expected_arrival_time || c.expected_departure_time;
+      if (aimed && expected) {
+        finalDelayInfo = {
+          delay: Math.round((new Date(expected) - new Date(aimed)) / 1000),
+          station: c.stop_point_name, time: fmtClock(expected),
+          confirmed: c.call_type === "recorded",
+        };
+      }
+    }
+  }
+
+  html += cardsRow([
+    card(fmtInt(tuRows.length), "GTFS-RT polls observed"),
+    card(fmtInt(pjRows.length), "SIRI polls observed"),
+    card(fmtInt(distinctTrips || distinctDays), "Distinct trips/days seen"),
+    card(finalDelayInfo ? fmtDelaySec(finalDelayInfo.delay) : "—", "Delay at final stop",
+      finalDelayInfo
+        ? `${finalDelayInfo.station}, ${finalDelayInfo.time}${finalDelayInfo.confirmed === false ? " (estimated)" : ""}`
+        : (lastSeen ? `no per-stop delay yet as of ${esc(lastSeen.slice(0, 19).replace("T", " "))} UTC` : "no delay data yet")),
+  ]);
+
+  // ---- Route ----
+  let routeRows = [];
+  if (pjRows.length) {
+    routeRows = groupCount(pjRows, ["origin_name", "destination_name"])
+      .map(r => ({ origin: r.origin_name, destination: r.destination_name, n: r.n }));
+  } else if (tuRows.length) {
+    routeRows = groupCount(tuRows, ["origin_uic", "destination_uic"])
+      .map(r => ({ origin: stationName(db, r.origin_uic), destination: stationName(db, r.destination_uic), n: r.n }));
+  }
+  if (routeRows.length) {
+    html += `<div class="section-title">Route</div>`;
+    if (routeRows.length === 1) {
+      html += `<div class="panel"><h3>${esc(routeRows[0].origin || "?")} → ${esc(routeRows[0].destination || "?")}</h3>
+        <p class="desc">Observed consistently across ${fmtInt(routeRows[0].n)} poll${routeRows[0].n === 1 ? "" : "s"}.</p></div>`;
+    } else {
+      html += panel("Route variants observed",
+        "Same train number seen running different origin/destination pairs — confirmed as real (not a parsing bug) against SNCF's static schedule, see HANDOFF.md.",
+        tableFrom(routeRows.map(r => ({ route: `${r.origin || "?"} → ${r.destination || "?"}`, n: r.n })),
+          [["route", "Route"], ["n", "Polls", "num"]]));
+    }
+  }
+
+  // ---- Schedule ----
+  let schedRows = [];
+  if (pjRows.length) {
+    const seen = new Set();
+    pjRows.forEach(r => {
+      const key = r.calendar_date + "|" + r.origin_aimed_departure_time;
+      if (seen.has(key)) return;
+      seen.add(key);
+      schedRows.push({ date: r.calendar_date, departs: fmtClock(r.origin_aimed_departure_time), arrives: fmtClock(r.destination_aimed_arrival_time) });
+    });
+  } else if (tuRows.length) {
+    const seen = new Set();
+    tuRows.forEach(r => {
+      const key = r.start_date + "|" + r.start_time;
+      if (seen.has(key)) return;
+      seen.add(key);
+      schedRows.push({ date: r.start_date, departs: (r.start_time || "").slice(0, 5), arrives: "—" });
+    });
+  }
+  schedRows.sort((a, b) => (a.date + a.departs).localeCompare(b.date + b.departs));
+  if (schedRows.length) {
+    html += `<div class="section-title">Schedule observed</div>`;
+    html += panel("Departure times seen",
+      "One row per distinct service day observed in this file's poll window — not a full weekly timetable yet, just what's been collected so far.",
+      tableFrom(schedRows.slice(0, 20), [["date", "Date"], ["departs", "Departs"], ["arrives", "Arrives"]]));
+  }
+
+  // ---- Stations it calls at ----
+  html += `<div class="section-title">Stations it calls at</div>`;
+  if (pjRows.length) {
+    const latest = pjRows[0];
+    const calls = queryRows(db,
+      `SELECT call_type, stop_point_name, aimed_arrival_time, aimed_departure_time,
+              arrival_platform_name, departure_platform_name
+       FROM platform_calls WHERE platform_journey_id = ?
+       ORDER BY COALESCE(aimed_arrival_time, aimed_departure_time)`, [latest.id]);
+    if (calls.length) {
+      html += panel(`Stop sequence — ${esc(latest.calendar_date || "latest observed run")}`,
+        "From the SIRI feed's most recently observed journey for this train. 'Confirmed' = SNCF has announced the platform; 'Likely' = not yet confirmed.",
+        tableFrom(calls.map(c => ({
+          stop: c.stop_point_name || "?",
+          time: fmtClock(c.aimed_arrival_time || c.aimed_departure_time),
+          platform: c.arrival_platform_name || c.departure_platform_name || "—",
+          status: c.call_type === "recorded" ? "Confirmed" : "Likely",
+        })), [["stop", "Station"], ["time", "Time"], ["platform", "Platform"], ["status", "Status"]]));
+    } else {
+      html += `<div class="note">No stop-level data for the latest journey.</div>`;
+    }
+  } else if (tuRows.length) {
+    const latest = tuRows[0];
+    const stops = queryRows(db,
+      // stop_sequence isn't ordered by here -- SNCF's feed never populates it (see the
+      // "Delay at final stop" comment above), so fall back to arrival/departure_time,
+      // which is always present and monotonically increasing along the route.
+      `SELECT stop_id, arrival_delay, arrival_time, departure_delay, departure_time
+       FROM stop_time_updates WHERE trip_update_id = ?
+       ORDER BY COALESCE(arrival_time, departure_time)`, [latest.id]);
+    if (stops.length) {
+      const namesResolved = !!window.STOP_NAMES;
+      html += panel("Stop sequence",
+        namesResolved
+          ? "This train wasn't seen on the SIRI feed, so falling back to GTFS-RT. Station names and times resolved from SNCF's static GTFS export (stops.txt), bundled locally in vendor/stops.js."
+          : "This train wasn't seen on the SIRI feed, so falling back to GTFS-RT. Station names couldn't be resolved (vendor/stops.js didn't load) — showing raw stop_id.",
+        tableFrom(stops.map(s => ({
+          stop: namesResolved ? gtfsStopName(s.stop_id) : s.stop_id,
+          time: fmtEpochParis(s.arrival_time !== null && s.arrival_time !== undefined ? s.arrival_time : s.departure_time),
+          arrival: fmtDelaySec(s.arrival_delay), departure: fmtDelaySec(s.departure_delay),
+        })), [["stop", "Station"], ["time", "Time"], ["arrival", "Arrival delay", "num"], ["departure", "Departure delay", "num"]]));
+    } else {
+      html += `<div class="note">No stop-level data for the latest trip_update.</div>`;
+    }
+  } else {
+    html += `<div class="note">No stop-level data available.</div>`;
+  }
+
+  // ---- Reliability ----
+  html += `<div class="section-title">On-time reliability</div>`;
+  const permStats = tableExists(db, "train_stats") ? queryRows(db,
+    `SELECT * FROM train_stats WHERE train_number = ?`, [trainNumber]) : [];
+
+  if (permStats.length) {
+    html += panel("Aggregated reliability (permanent layer)", "Built by aggregate.py from completed trips at least a day old.",
+      tableFrom(permStats.map(r => ({
+        day_type: r.day_type,
+        trips: r.observations,
+        cancelled: r.cancelled_count,
+        avg_delay: fmtDelaySec(r.observations ? r.sum_final_delay / r.observations : null),
+        on_time: pct(r.on_time_count, r.observations),
+        late_15: pct(r.late_15_count, r.observations),
+      })), [["day_type", "Day type"], ["trips", "Trips", "num"], ["cancelled", "Cancelled", "num"],
+            ["avg_delay", "Avg final delay", "num"], ["on_time", "On time (<5m)", "num"], ["late_15", "15m+ late", "num"]]));
+
+    const stationStats = tableExists(db, "train_station_stats") ? queryRows(db,
+      `SELECT * FROM train_station_stats WHERE train_number = ? ORDER BY observations DESC LIMIT 15`, [trainNumber]) : [];
+    if (stationStats.length) {
+      html += panel("Per-station breakdown", "", tableFrom(stationStats.map(r => ({
+        station: stationName(db, r.station_uic),
+        day_type: r.day_type,
+        obs: r.observations,
+        avg_arrival_delay: fmtDelaySec(r.arrival_observations ? r.sum_arrival_delay / r.arrival_observations : null),
+        on_time: pct(r.on_time_count, r.arrival_observations),
+      })), [["station", "Station"], ["day_type", "Day type"], ["obs", "Obs", "num"],
+            ["avg_arrival_delay", "Avg arrival delay", "num"], ["on_time", "On time", "num"]]));
+    }
+  } else {
+    html += `<div class="note">No long-term reliability stats yet — <code>aggregate.py</code> only folds in trips at least a day old,
+      and this file doesn't have that history. The numbers below are a live proxy computed directly from the ${fmtInt(tuRows.length)}
+      raw poll${tuRows.length === 1 ? "" : "s"} of this train in this file, to show the shape of what the real reliability table
+      will look like once the pipeline has run for weeks. <strong>Not</strong> a real punctuality statistic yet.</div>`;
+
+    if (tuRows.length) {
+      const delays = tuRows.map(r => r.trip_update_delay).filter(v => v !== null && v !== undefined);
+      if (delays.length) {
+        const avg = delays.reduce((a, b) => a + b, 0) / delays.length;
+        html += cardsRow([
+          card(fmtDelaySec(avg), "Avg delay across polls (proxy)"),
+          card(fmtDelaySec(Math.min(...delays)), "Best observed"),
+          card(fmtDelaySec(Math.max(...delays)), "Worst observed"),
+        ]);
+      }
+
+      const stopStats = queryRows(db,
+        `SELECT stu.stop_id,
+                COUNT(*) as observations,
+                AVG(stu.arrival_delay) as avg_arrival_delay,
+                SUM(CASE WHEN stu.arrival_delay < 300 THEN 1 ELSE 0 END) as on_time,
+                SUM(CASE WHEN stu.arrival_delay >= 900 THEN 1 ELSE 0 END) as late15plus
+         FROM stop_time_updates stu
+         JOIN trip_updates tu ON tu.id = stu.trip_update_id
+         WHERE tu.commercial_train_number = ? AND stu.arrival_delay IS NOT NULL
+         GROUP BY stu.stop_id ORDER BY observations DESC LIMIT 15`, [trainNumber]);
+      if (stopStats.length) {
+        html += panel("Per-stop delay (live proxy)",
+          "Same bucket thresholds the real train_station_stats table will use (on-time under 5 min, 15 min+ late) — computed live instead of from a day-old completed trip. Station names resolved from the static GTFS export.",
+          tableFrom(stopStats.map(r => ({
+            stop: gtfsStopName(r.stop_id), obs: r.observations,
+            avg_delay: fmtDelaySec(r.avg_arrival_delay),
+            on_time: pct(r.on_time, r.observations),
+            late15: pct(r.late15plus, r.observations),
+          })), [["stop", "Station"], ["obs", "Obs", "num"], ["avg_delay", "Avg arrival delay", "num"],
+                ["on_time", "On time", "num"], ["late15", "15m+ late", "num"]]));
+      }
+    }
+
+    if (pjRows.length) {
+      const pcStats = queryRows(db,
+        `SELECT pc.call_type, COUNT(*) as n,
+                SUM(CASE WHEN pc.arrival_platform_name IS NOT NULL OR pc.departure_platform_name IS NOT NULL THEN 1 ELSE 0 END) as with_platform
+         FROM platform_calls pc JOIN platform_journeys pj ON pj.id = pc.platform_journey_id
+         WHERE pj.train_number = ? GROUP BY pc.call_type`, [trainNumber]);
+      if (pcStats.length) {
+        html += panel("Platform confirmation (live proxy)", "'recorded' = SNCF already confirmed; 'estimated' = not yet.",
+          tableFrom(pcStats.map(r => ({ call_type: r.call_type, n: r.n, rate: pct(r.with_platform, r.n) })),
+            [["call_type", "Call type"], ["n", "Calls", "num"], ["rate", "Has platform", "num"]]));
+      }
+    }
+  }
+
+  results.innerHTML = html;
+}
+
+document.querySelectorAll(".tab-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(btn.dataset.tab).classList.add("active");
+  });
+});
+
+document.getElementById("trainSearchBtn").addEventListener("click", () => {
+  renderTrainResult(currentDb, document.getElementById("trainInput").value);
+});
+document.getElementById("trainInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    document.getElementById("trainSearchBtn").click();
+  }
+});
+
+async function initSql() {
+  if (SQL) return SQL;
+  if (window.__vendorLoadError) {
+    throw new Error(
+      `Couldn't load ${window.__vendorLoadError}. This dashboard needs its "vendor" ` +
+      `folder to sit right next to dashboard.html (don't move or rename dashboard.html on its own).`
+    );
+  }
+  if (typeof window.initSqlJs !== "function") {
+    throw new Error(
+      "sql.js didn't load (window.initSqlJs is missing). Make sure the 'vendor' folder " +
+      "(sql-asm.js, chart.umd.min.js, chartjs-adapter-date-fns.bundle.min.js) is in the same " +
+      "directory as this HTML file, then reload the page."
+    );
+  }
+  SQL = await window.initSqlJs();
+  return SQL;
+}
+
+document.getElementById("fileInput").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById("fname").textContent = file.name;
+  document.getElementById("main").innerHTML = `<div class="loading">Loading ${esc(file.name)}…</div>`;
+  currentDb = null;
+  resetTrainTab();
+  try {
+    const sql = await initSql();
+    const buf = await file.arrayBuffer();
+    const db = new sql.Database(new Uint8Array(buf));
+    currentDb = db;
+    buildDashboard(db, file.name, file.size);
+    buildTrainIndex(db);
+  } catch (err) {
+    console.error(err);
+    document.getElementById("main").innerHTML = `<div class="error-msg">Couldn't load this database.<br>${esc(err.message || err)}</div>`;
+  }
+});
+</script>
+</body>
+</html>

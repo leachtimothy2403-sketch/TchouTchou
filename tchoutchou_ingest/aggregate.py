@@ -174,8 +174,20 @@ def process_trip(cur, trip_id, start_date):
         return
 
     # --- final observed delay per stop: last snapshot to report that stop wins ---
+    #
+    # stop_sequence is deliberately NOT selected here (or used below to find the final
+    # stop) -- SNCF's live feed never actually populates it. Confirmed by direct count
+    # against two real collection runs: 0 non-null stop_sequence values out of 250,000+
+    # stop_time_updates rows. The previous version of this function used
+    # max(stop_sequence) to find "the final stop of the trip"; since every row ties at
+    # the same (missing) value, Python's max() silently returned the first-inserted
+    # item instead -- effectively the origin stop, not the destination -- which would
+    # have made train_stats.sum_final_delay measure the wrong end of the trip. Using
+    # arrival_time/departure_time instead (absolute epoch seconds, always present, and
+    # monotonically increasing along the route) avoids depending on a field that isn't
+    # actually there.
     cur.execute(
-        "SELECT stu.stop_id, stu.stop_sequence, stu.arrival_delay, stu.departure_delay "
+        "SELECT stu.stop_id, stu.arrival_delay, stu.arrival_time, stu.departure_delay, stu.departure_time "
         "FROM stop_time_updates stu "
         "JOIN trip_updates tu ON tu.id = stu.trip_update_id "
         "JOIN snapshots s ON s.id = tu.snapshot_id "
@@ -183,8 +195,8 @@ def process_trip(cur, trip_id, start_date):
         (trip_id, start_date),
     )
     final_by_stop = {}
-    for stop_id, stop_sequence, arrival_delay, departure_delay in cur.fetchall():
-        final_by_stop[stop_id] = (stop_sequence, arrival_delay, departure_delay)
+    for stop_id, arrival_delay, arrival_time, departure_delay, departure_time in cur.fetchall():
+        final_by_stop[stop_id] = (arrival_delay, arrival_time, departure_delay, departure_time)
 
     if not final_by_stop:
         cur.execute(
@@ -197,7 +209,7 @@ def process_trip(cur, trip_id, start_date):
     direction_id_val = direction_id if direction_id is not None else -1
     train_type_bucket = train_type or "unknown"
 
-    for stop_id, (stop_sequence, arrival_delay, departure_delay) in final_by_stop.items():
+    for stop_id, (arrival_delay, _arrival_time, departure_delay, _departure_time) in final_by_stop.items():
         station_uic = extract_uic(stop_id)
         if station_uic is None:
             continue
@@ -252,9 +264,16 @@ def process_trip(cur, trip_id, start_date):
             ),
         )
 
-    # --- end-to-end trip delay: the final stop by stop_sequence ---
-    _last_stop_id, (final_seq, final_arrival_delay, final_departure_delay) = max(
-        final_by_stop.items(), key=lambda kv: (kv[1][0] if kv[1][0] is not None else -1)
+    # --- end-to-end trip delay: the final stop, identified by whichever stop has the
+    # latest observed arrival/departure time -- see the comment above on why this isn't
+    # stop_sequence. ---
+    def _stop_order_time(v):
+        _arrival_delay, arrival_time, _departure_delay, departure_time = v
+        t = arrival_time if arrival_time is not None else departure_time
+        return t if t is not None else -1
+
+    _last_stop_id, (final_arrival_delay, _final_arrival_time, final_departure_delay, _final_departure_time) = max(
+        final_by_stop.items(), key=lambda kv: _stop_order_time(kv[1])
     )
     trip_final_delay = final_arrival_delay if final_arrival_delay is not None else final_departure_delay
     on_time, late5, late15, late30 = bucket_counts(trip_final_delay)
