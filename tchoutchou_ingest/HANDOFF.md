@@ -23,8 +23,10 @@ Two SNCF open-data feeds, each with its own raw + permanent-aggregate pipeline:
 Both write into the same layered SQLite schema:
 
 - **Raw layer** (`snapshots`, `trip_updates`, `stop_time_updates`, `service_alerts`) —
-  every GTFS-RT poll, kept for a retention window (default 90 days), then purged by
-  `purge_raw.py` once folded into the permanent layer. Retained on a window (rather than
+  every GTFS-RT poll, kept for a retention window (5 days as of 2026-08-18, down from an
+  original 90-day default — see the `--retention-days 5` note further down; short for now
+  due to VPS disk constraints), then purged by `purge_raw.py` once folded into the
+  permanent layer. Retained on a window (rather than
   deleted immediately after aggregation) for two reasons: (1) it lets you recompute or
   redefine the permanent stats later without re-collecting — useful while the
   aggregation logic is still evolving (see the `stop_sequence` bug fixed 2026-08-17,
@@ -204,7 +206,7 @@ git pull
 # only needed the first time -- skip these two lines if the Task Scheduler jobs below
 # are already set up and have been running
 python aggregate.py --db tchoutchou.db
-python purge_raw.py --db tchoutchou.db --retention-days 90
+python purge_raw.py --db tchoutchou.db --retention-days 5
 
 # platform-layer schema migration
 python -c "
@@ -259,7 +261,7 @@ cd /d C:\TchouTchou\tchoutchou_ingest
 ```bat
 @echo off
 cd /d C:\TchouTchou\tchoutchou_ingest
-.venv\Scripts\python.exe purge_raw.py --db tchoutchou.db --retention-days 90 --vacuum >> purge.log 2>&1
+.venv\Scripts\python.exe purge_raw.py --db tchoutchou.db --retention-days 5 --vacuum >> purge.log 2>&1
 ```
 ```powershell
 schtasks /Create /TN "TchouTchou Aggregate" /TR "C:\TchouTchou\tchoutchou_ingest\run_aggregate.bat" /SC DAILY /ST 03:00 /RU SYSTEM
@@ -267,6 +269,18 @@ schtasks /Create /TN "TchouTchou Purge" /TR "C:\TchouTchou\tchoutchou_ingest\run
 ```
 (purge runs 15 minutes after aggregate on purpose — `purge_raw.py` refuses to delete
 anything not yet aggregated, so aggregate needs to finish first)
+
+**`--retention-days 5`, not 90, chosen 2026-08-18 under disk pressure**: measured GTFS-RT
+raw growth is ~2.2 GB/day (see the platform-layer-redesign section above), and this VPS
+had only ~23GB free at the time — roughly 10 days to disk-full at that rate. A 90-day (or
+even 14-day) retention window wouldn't start deleting anything until data is that many
+days old, which is *after* the disk would fill, since collection had only been running
+~1 day. 5 days is close to the minimum workable value (`aggregate.py` needs a trip ≥1 day
+old before `purge_raw.py` will touch it, so anything much shorter leaves little margin)
+and was chosen to get purging actually happening within the first week. Trade-off: only
+5 days of raw history to reprocess a bug from or pull exact percentiles against, down
+from the original 90. Revisit upward if/once disk headroom improves (bigger volume) or
+`--no-raw` cuts the daily footprint enough to afford a longer window again.
 
 ## Next steps, in order
 
