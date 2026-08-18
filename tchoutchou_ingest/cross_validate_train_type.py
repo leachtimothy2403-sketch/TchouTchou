@@ -11,14 +11,24 @@ product_category_ref, joining trip_updates <-> platform_journeys on
    consistently pair with RER/Transilien line names, that's a real, data-backed mapping
    ready to add to parse.py, not a guess.
 
-2. Flag any ALREADY-mapped service_code whose line_name/product_category_ref looks
-   inconsistent across trains -- a sign the mapping might be wrong for some slice of
-   trains, not just incomplete. A clean, confidently-mapped code should show one
-   dominant line_name/product_category_ref pattern, not several unrelated ones.
+2. Flag any ALREADY-mapped service_code whose product_category_ref looks inconsistent
+   across trains -- a sign the mapping might be wrong for some slice of trains, not just
+   incomplete. line_name is deliberately NOT used for this check -- a broad category
+   like TER legitimately spans dozens of real regional lines, so line_name diversity is
+   expected and not a signal of anything wrong. product_category_ref should still be
+   consistent within one service_code even when line_name varies a lot.
+
+Date join note: GTFS-RT's start_date follows GTFS convention -- a trip that runs past
+midnight keeps the service day it STARTED on, not the calendar date the stop falls on.
+SIRI's calendar_date is a real calendar date. So a train departing 23:50 and arriving
+01:30 has start_date = yesterday but calendar_date = today, and would silently miss an
+exact-date join. --loose-date (default on) also tries calendar_date = start_date + 1 day
+to catch these; use --no-loose-date to see the strict-match-only count for comparison.
 
 Usage:
     python cross_validate_train_type.py --db tchoutchou.db
     python cross_validate_train_type.py --db tchoutchou.db --min-count 3
+    python cross_validate_train_type.py --db tchoutchou.db --no-loose-date
 """
 import argparse
 import sqlite3
@@ -30,17 +40,26 @@ def main():
     ap.add_argument("--db", default="tchoutchou.db")
     ap.add_argument("--min-count", type=int, default=2,
                      help="Only print a line_name/product_category_ref variant seen at least this often (default 2)")
+    ap.add_argument("--loose-date", dest="loose_date", action="store_true", default=True,
+                     help="Also match calendar_date = start_date + 1 day, to catch trains that cross midnight (default on)")
+    ap.add_argument("--no-loose-date", dest="loose_date", action="store_false",
+                     help="Strict date match only (calendar_date = start_date)")
     args = ap.parse_args()
 
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     cur = conn.cursor()
 
+    date_condition = (
+        "(pj.calendar_date = tu.start_date OR pj.calendar_date = date(tu.start_date, '+1 day'))"
+        if args.loose_date else
+        "pj.calendar_date = tu.start_date"
+    )
     rows = cur.execute(
         "SELECT DISTINCT tu.service_code, tu.train_type, pj.line_name, pj.product_category_ref, "
         "tu.commercial_train_number "
         "FROM trip_updates tu "
         "JOIN platform_journeys pj "
-        "  ON pj.train_number = tu.commercial_train_number AND pj.calendar_date = tu.start_date "
+        f"  ON pj.train_number = tu.commercial_train_number AND {date_condition} "
         "WHERE tu.service_code IS NOT NULL"
     ).fetchall()
 
@@ -55,9 +74,11 @@ def main():
           f"percentage is low).\n")
 
     by_code = defaultdict(lambda: defaultdict(int))
+    product_cat_counts_by_code = defaultdict(lambda: defaultdict(int))
     train_type_by_code = {}
     for service_code, train_type, line_name, product_cat, _train in rows:
         by_code[service_code][(line_name, product_cat)] += 1
+        product_cat_counts_by_code[service_code][product_cat] += 1
         train_type_by_code[service_code] = train_type
 
     unmapped = {"ICN", "TRN", "NA", None}
@@ -75,12 +96,19 @@ def main():
             print(f"    line_name={str(line_name):30s} product_category_ref={str(product_cat):20s}  n={n}")
         if not shown:
             print(f"    (no variant seen >= {args.min_count} times)")
-        # Consistency check: if a code that's ALREADY mapped shows more than a couple
-        # distinct (line_name, product_category_ref) pairs, that's worth a second look --
-        # a clean mapping should be dominated by one pattern.
-        if service_code not in unmapped and len(variants) > 3:
-            print(f"    NOTE: {len(variants)} distinct line_name/product_category_ref variants for an "
-                  f"already-mapped code -- worth checking this isn't masking a real split.")
+        # Consistency check keyed on product_category_ref ONLY, not line_name -- a broad
+        # category (TER, CTE) legitimately spans many real lines, so line_name diversity
+        # is expected and not a signal of anything wrong. product_category_ref should
+        # still be a single dominant value even when line_name varies a lot; several
+        # product_category_ref values for one service_code is the real inconsistency
+        # signal (e.g. OUIGO's real highSpeedRail/local split from its two sub-brands is
+        # borderline-expected; a code showing 3+ unrelated categories is worth a look).
+        cat_counts = product_cat_counts_by_code[service_code]
+        if service_code not in unmapped and len(cat_counts) > 1:
+            cat_summary = ", ".join(f"{cat}={n}" for cat, n in sorted(cat_counts.items(), key=lambda kv: -kv[1]))
+            print(f"    NOTE: product_category_ref varies for an already-mapped code: {cat_summary} "
+                  f"-- worth checking this isn't masking a real split (line_name diversity alone is normal "
+                  f"and not flagged).")
         print()
 
     conn.close()
