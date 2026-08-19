@@ -8,9 +8,19 @@ the VPS.
 2026-08-17, survived a platform-layer schema migration on 2026-08-18 (see "Migrating an
 existing VPS db" below), and is now on a 5-day raw-retention window due to VPS disk
 constraints (~23GB free as of 2026-08-18). Git is set up and has been pushed to
-multiple times (see "Git" below — no init needed, that step's done). Actively in
-progress: validating the new SIRI upsert logic against real traffic before deciding
-whether to drop its raw_gzip safety net (see "SIRI upsert validation" below).
+multiple times (see "Git" below — no init needed, that step's done). The
+`TchouTchou Aggregate`/`TchouTchou Purge` Task Scheduler jobs are now created on the VPS
+(confirmed 2026-08-19) — not yet observed running on their own schedule (03:00/03:15
+daily) though, so worth checking `aggregate.log`/`purge.log` after the next scheduled
+run to confirm they actually fire and succeed unattended, not just that the task
+definitions exist. Two things actively in progress: (1) validating
+the new SIRI upsert logic against real traffic before dropping its raw_gzip safety net
+(see "SIRI upsert validation" below — first spot-check round done, 2/2 correct, second
+round pending), and (2) cross-validating `service_code`→`train_type` against SIRI's
+`line_name`/`product_category_ref` to decode the unmapped codes — currently **stuck** on
+an unexplained low join-match-rate; a summary was written for outside advice
+(`CROSS_VALIDATION_STUCK_SUMMARY.md`) and hasn't been resolved yet (see "Train-type
+cross-validation" below).
 
 ## What TchouTchou is
 
@@ -82,7 +92,9 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
 | `monitor_snapshot.py` | Exports a small (~MB) health-check snapshot of a multi-GB db — row counts, full permanent + platform layers, a sample of the raw layer. Use this to check on the VPS db without transferring the whole file. |
 | `check_raw_blob_share.py` | One-off diagnostic: how many bytes of the db are `snapshots.raw_gzip` blobs vs everything else, broken down by feed. Informs the `--no-raw` decision. |
 | `compare_platform_snapshots.py` | Diffs two `monitor_snapshot.py` exports to catch silent platform-data regressions (a confirmed platform going blank, or recorded→estimated) in the new SIRI upsert logic, plus a spot-check list for manual verification against reality. See "SIRI upsert validation" below. |
-| `cross_validate_train_type.py` | Joins `trip_updates`/`platform_journeys` on train_number+date to cross-check `service_code`-derived `train_type` against SIRI's `line_name`/`product_category_ref` — decodes currently-unmapped codes (`ICN`/`TRN`/`NA`) from real traffic and flags already-mapped codes with inconsistent line_name patterns. |
+| `cross_validate_train_type.py` | Joins `trip_updates`/`platform_journeys` on train_number+date to cross-check `service_code`-derived `train_type` against SIRI's `line_name`/`product_category_ref` — decodes currently-unmapped codes (`ICN`/`TRN`/`NA`) from real traffic and flags already-mapped codes with inconsistent `product_category_ref` (not `line_name` — see script docstring for why). Currently blocked on a low join-match-rate mystery, see `CROSS_VALIDATION_STUCK_SUMMARY.md`. |
+| `check_mission_codes.py` | One-off diagnostic run while debugging the cross-validation join above: splits `platform_journeys.train_number` values that aren't plain digits into coupled-unit pairs (e.g. `"126682-126683"`) vs true alphanumeric mission codes (e.g. `"UMOL09"`, RER/Transilien style) — the latter can never join against GTFS-RT's `commercial_train_number`, confirmed always pure-digit. |
+| `CROSS_VALIDATION_STUCK_SUMMARY.md` | Write-up of the train-type cross-validation investigation (see "Train-type cross-validation" below) for getting a second opinion — what we're trying to do, four join-key attempts and what each ruled in/out, and where it's stuck. Written 2026-08-19, not yet resolved. |
 | `find_examples.py`, `stats.py`, `peek.py`, `validate_extraction.py` | Ad hoc exploration/validation scripts used during development, not part of the running pipeline. |
 | `getplatform.py`, `testsncf.py` | Original exploration scripts (yours) that the pipeline grew out of. Kept for reference. |
 | `requirements.txt` | `requests`, `gtfs-realtime-bindings` — the only two non-stdlib dependencies. |
@@ -94,8 +106,11 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
   trips in the static `trips.txt`, zero mismatches.
 - **Service code → train type mapping** — TER, TGV INOUI, OUIGO, Intercités, TGV Lyria,
   France-Germany ICE, Navette, Car TER, Car à réservation all confirmed "high
-  confidence" via live examples. `ICN`, `TRN`, and `NA` are still unmapped/low
-  confidence.
+  confidence" via live examples. `TRN` and `NA` are still unmapped/low confidence. `ICN`
+  has a strong but not-yet-applied candidate decode (likely "Intercités de Nuit") from
+  the in-progress cross-validation work — see "Train-type cross-validation" below —
+  16/16 matched trains are `longDistance`, but hasn't been added to `parse.py` yet
+  pending the rest of that investigation.
 - **Station name resolution** — confirmed correct against a real UIC lookup
   (Montpellier Saint-Roch).
 - **Storage rate** — original estimate (~2.6 GB/day, from a 2-hour sample) turned out to
@@ -142,15 +157,62 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
   history in `trip_updates`/`stop_time_updates` and the blob there is a cheaper,
   lower-stakes safety net.
 
+## Train-type cross-validation (in progress, stuck as of 2026-08-19)
+
+Goal: join `trip_updates` and `platform_journeys` on train number (+ date) to decode the
+three unmapped GTFS-RT `service_code`s (`ICN`, `TRN`, `NA`) using SIRI's `line_name`/
+`product_category_ref` as ground truth, and sanity-check the already-mapped codes for
+internal consistency. Triggered by a manual spot-check that identified `UMOL09` = RER
+Ligne A and `164405` = Transilien Ligne N — suggesting the unmapped codes might decode
+cleanly if cross-referenced.
+
+**Four attempts so far, in order:**
+1. Strict date join (`trip_updates.start_date = platform_journeys.calendar_date`):
+   matched only 262 of 10,425 distinct GTFS-RT trains (2.5%).
+2. Hypothesized a midnight-crossing date bug (GTFS's `start_date` keeps a trip's
+   original service day even past midnight; SIRI's `calendar_date` likely doesn't).
+   Added a loose-date join option. **Match count barely moved (262→263) — hypothesis
+   wrong or not dominant.**
+3. Checked the real denominator: `platform_journeys` only has 1,106 distinct
+   `train_number` total (SIRI covers far fewer trains than GTFS-RT). Against that
+   ceiling the match rate is really 23.7%, not 2.5% — better framing, still a big gap.
+4. Checked non-numeric `train_number` values: 143 of 1,106 (12.9%) aren't plain digits.
+   GTFS-RT's `commercial_train_number` is confirmed to **never** contain a non-digit
+   character (0 of 10,425), so these can only ever match if split into two known types:
+   coupled-unit pairs like `"126682-126683"` (potentially fixable — split on `-`, try
+   either half) vs. true alphanumeric mission codes like `"UMOL09"` (permanently
+   unmatchable — a real scope difference between the feeds, not a bug). Split-count
+   results from `check_mission_codes.py` were pending when this doc was last updated.
+
+**Where it's actually stuck**: even excluding all 143 non-numeric trains, the ceiling
+only drops to ~963, and the match count (262) is still under a third of that. **We have
+not found why several hundred trains with plausibly-compatible plain numeric IDs in both
+feeds still fail to join.** Untested: whether SIRI ET Lite has a genuinely narrower
+geographic/operational scope than the specific GTFS-RT proxy in use, independent of any
+join bug; a subtler format issue not visible in the small manual samples checked so far.
+
+**What's usable regardless**: `ICN` decodes cleanly (16/16 matched trains are
+`longDistance` — likely "Intercités de Nuit"/night trains). `TER`, `CTE`, `IC` show a
+single dominant `product_category_ref` each — those existing mappings look solid. `OUI`
+(TGV INOUI) and `OGO` (OUIGO) both show a `product_category_ref` split that's plausibly
+*correct*, not a bug (OUIGO genuinely has two sub-brands; some INOUI legs may run on
+conventional track). `TRN`/`NA` — the two codes we most wanted to decode — still don't
+have enough matched samples to conclude anything.
+
+Full writeup with reasoning for each attempt: `CROSS_VALIDATION_STUCK_SUMMARY.md`
+(written 2026-08-19 to get a second opinion from elsewhere — check whether that produced
+any new direction before re-attempting this from scratch).
+
 ## What's NOT done yet
 
 - **`station_uic` isn't stored as a column** on `platform_variants` /
   `platform_lead_time_stats`, even though it's derivable (deliberately, to avoid an
   ALTER TABLE mid-collection). Add it once you actually need to query platform stats by
   station rather than by raw `stop_point_ref`.
-- **`product_category_ref` not cross-validated** against `parse.py`'s
-  `service_code`-derived `train_type` — a second independent train-type signal,
-  currently unused.
+- **`product_category_ref` cross-validation is in progress but stuck** — see "Train-type
+  cross-validation" above and `CROSS_VALIDATION_STUCK_SUMMARY.md`. Not simply "not
+  started" anymore; there's real partial progress (ICN decoded, TER/CTE/IC confirmed
+  solid) blocked on an unexplained low join-match-rate.
 - **True cancellation detection** — `cancelled_count` only counts trips GTFS-RT
   explicitly marked `CANCELED`. A train that never appears in the feed at all looks
   identical to "wasn't scheduled today" without cross-referencing the static
@@ -322,10 +384,10 @@ from the original 90. Revisit upward if/once disk headroom improves (bigger volu
 
 ## Next steps, in order
 
-1. Confirm the two Task Scheduler jobs (`TchouTchou Aggregate`, `TchouTchou Purge`) are
-   actually created on the VPS — `schtasks /query /TN "TchouTchou Purge"` to check.
-   These were still manual as of 2026-08-18; without them the 5-day retention window
-   isn't self-enforcing.
+1. ~~Confirm the two Task Scheduler jobs are actually created on the VPS~~ — **done,
+   confirmed 2026-08-19**. Still worth a one-time check after the next scheduled run
+   (03:00/03:15 daily) that `aggregate.log`/`purge.log` show a clean unattended run, not
+   just that the task definitions exist.
 2. Finish the SIRI upsert validation (see above) — run `compare_platform_snapshots.py`
    against a same-day, higher-traffic pair of exports, and a few more manual spot-checks
    during daytime service. Once clean, drop SIRI's raw blob (`--no-raw` currently
@@ -336,6 +398,10 @@ from the original 90. Revisit upward if/once disk headroom improves (bigger volu
 4. Let it run **2-4 weeks minimum** before treating any punctuality number as
    meaningful — a day or two of data just checks the pipeline survives unattended, it
    doesn't smooth out one-off disruptions (strikes, engineering works, weather).
-5. Once there's real history: add the `station_uic` column to the platform tables,
-   cross-validate `product_category_ref` (early signal from spot-checks: UMOL09→RER A,
-   164405→Transilien N both look right), and consider the delay-propagation table.
+5. Resume the train-type cross-validation (see "Train-type cross-validation" above) —
+   check `CROSS_VALIDATION_STUCK_SUMMARY.md` for whether outside advice produced a new
+   direction before re-attempting the low-match-rate mystery from scratch. Once
+   unblocked: finish decoding `TRN`/`NA`, add `ICN` → likely "Intercités de Nuit" to
+   `parse.py` (already has a clean 16/16 signal, just needs applying), and add the
+   `station_uic` column to the platform tables once there's real history to query by
+   station.

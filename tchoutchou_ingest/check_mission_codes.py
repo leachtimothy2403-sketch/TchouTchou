@@ -36,4 +36,16 @@ if alnum_pj:
           f"use a non-numeric train_number -- these can only match GTFS-RT if commercial_train_number "
           f"is also ever non-numeric (see the trip_updates count above).")
 
+# Split the "non-numeric" bucket into two genuinely different things: coupled-unit pairs
+# like "126682-126683" (still plain digits either side of one hyphen -- potentially
+# matchable by splitting on '-' and trying either half) vs true alphanumeric mission
+# codes like "UMOL09" (RER/Transilien style -- structurally unmatchable against
+# trip_updates, which never contains a letter at all per the count above).
+hyphen_pairs = [t for t in alnum_pj if t.count("-") == 1 and all(p.isdigit() for p in t.split("-"))]
+true_alnum = [t for t in alnum_pj if t not in hyphen_pairs]
+print()
+print(f"Of the {len(alnum_pj)} non-numeric train_number values:")
+print(f"  {len(hyphen_pairs)} are coupled-unit pairs (digits-digits, e.g. {hyphen_pairs[:3] if hyphen_pairs else '(none)'})")
+print(f"  {len(true_alnum)} are true alphanumeric mission codes (e.g. {true_alnum[:10] if true_alnum else '(none)'})")
+
 conn.close()
