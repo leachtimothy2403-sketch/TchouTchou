@@ -7,12 +7,17 @@ deep-link to SNCF Connect for booking. Crowd insights has no underlying data sou
 (see /trains/{train_number}/crowd) -- stubbed honestly rather than faked, see its
 docstring.
 
-Run:
+Run (either works the same):
     pip install -r requirements.txt
-    TCHOUTCHOU_DB=tchoutchou.db uvicorn main:app --host 0.0.0.0 --port 8000
+    TCHOUTCHOU_DB=tchoutchou.db python main.py
+    # or, equivalently:
+    TCHOUTCHOU_DB=tchoutchou.db python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+(PowerShell: `$env:TCHOUTCHOU_DB = "tchoutchou.db"; python main.py`)
 
 Then open http://localhost:8000/ for the minimal UI, or hit the JSON endpoints directly
-(e.g. http://localhost:8000/api/trains/9575/status).
+(e.g. http://localhost:8000/api/trains/9575/status). Ctrl+C to stop -- it runs in the
+foreground; for an unattended run see "Deploying" in README.md.
 
 Run this next to wherever the live db actually is (the VPS, for real-time data) -- see
 tchoutchou_api/README.md.
@@ -385,3 +390,17 @@ def index():
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+if __name__ == "__main__":
+    # Lets `python main.py` work directly, not just `python -m uvicorn main:app ...` --
+    # running this file with plain `python main.py` used to do nothing (FastAPI needs an
+    # ASGI server to actually serve requests; importing the file alone just builds the
+    # `app` object and exits). Both ways of running it now work the same.
+    import uvicorn
+    import os as _os
+    host = _os.environ.get("TCHOUTCHOU_API_HOST", "0.0.0.0")
+    port = int(_os.environ.get("TCHOUTCHOU_API_PORT", "8000"))
+    print(f"Starting TchouTchou API on http://{host}:{port} "
+          f"(db: {_os.environ.get('TCHOUTCHOU_DB', 'tchoutchou.db')})")
+    uvicorn.run(app, host=host, port=port)
