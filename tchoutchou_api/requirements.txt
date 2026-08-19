@@ -1,2 +1,7 @@
 fastapi
 uvicorn[standard]
+# zoneinfo (stdlib) needs this on Windows specifically -- Python's zoneinfo module reads
+# the OS's IANA timezone database, which Windows doesn't ship; without tzdata,
+# ZoneInfo("Europe/Paris") raises ZoneInfoNotFoundError. Not needed on Linux/Mac (the VPS
+# is Windows, per HANDOFF.md, so this is required there).
+tzdata

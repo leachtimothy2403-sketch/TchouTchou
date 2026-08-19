@@ -24,6 +24,7 @@ tchoutchou_api/README.md.
 """
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -32,6 +33,19 @@ from fastapi.staticfiles import StaticFiles
 from db import get_conn, extract_uic, train_label, is_mission_code, station_name
 
 app = FastAPI(title="TchouTchou API", version="0.1.0")
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
+
+
+def _fmt_time(unix_ts):
+    """arrival_time/departure_time on stop_time_updates are raw Unix timestamps (GTFS-RT
+    StopTimeEvent.time, seconds since epoch, UTC) -- found 2026-08-19 that the API was
+    never actually returning these at all, only the *_delay fields, and the UI labeled
+    those "Arr."/"Dep." as if they were clock times. A delay of 0 (on time) then looked
+    identical to "no data". Fixed to return the real formatted local time here."""
+    if unix_ts is None:
+        return None
+    return datetime.fromtimestamp(unix_ts, tz=PARIS_TZ).strftime("%H:%M")
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +216,9 @@ def train_status(train_number: str, date: Optional[str] = None):
                     "stop_sequence": s["stop_sequence"],
                     "station_uic": uic,
                     "station_name": station_name(conn, uic) or (call["stop_point_name"] if call else None),
+                    "arrival_time": _fmt_time(s["arrival_time"]),
                     "arrival_delay_minutes": round(s["arrival_delay"] / 60) if s["arrival_delay"] is not None else None,
+                    "departure_time": _fmt_time(s["departure_time"]),
                     "departure_delay_minutes": round(s["departure_delay"] / 60) if s["departure_delay"] is not None else None,
                     "schedule_relationship": s["schedule_relationship"],
                     "arrival_platform": _platform_status(conn, train_number, uic, "arrival", call) if uic else {"status": "Unknown", "platform": None},

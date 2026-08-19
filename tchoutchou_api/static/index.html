@@ -52,6 +52,11 @@
   .delay.ontime { color: var(--ok); }
   .delay.late { color: var(--warn); }
   .delay.verylate { color: var(--bad); }
+  .stop-time { font-variant-numeric: tabular-nums; }
+  .delay-suffix { font-size: 0.8rem; font-weight: 600; }
+  .delay-suffix.ontime { color: var(--ok); }
+  .delay-suffix.late { color: var(--warn); }
+  .delay-suffix.verylate { color: var(--bad); }
   .note { color: var(--muted); font-size: 0.85rem; margin-top: 8px; line-height: 1.4; }
   table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
   th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--border); }
@@ -120,6 +125,19 @@ function platformBadge(p) {
   return `<span class="badge ${p.status}">${label}</span>`;
 }
 
+// Shows the actual clock time plus the delay next to it, e.g. "15:27 +2" -- previously
+// this table only showed the delay number with no time at all, which made an on-time
+// stop (delay 0) look identical to missing data. Fixed 2026-08-19.
+function timeCell(time, delayMin) {
+  if (!time) return '<span class="stop-time">–</span>';
+  let delayStr = '';
+  if (delayMin !== null && delayMin !== undefined) {
+    const sign = delayMin > 0 ? '+' : '';
+    delayStr = ` <span class="delay-suffix ${delayClass(delayMin)}">${sign}${delayMin}</span>`;
+  }
+  return `<span class="stop-time">${time}</span>${delayStr}`;
+}
+
 function render(data, trainNumber) {
   const s = data.status || {};
   const rel = data.reliability || {};
@@ -155,8 +173,8 @@ function render(data, trainNumber) {
     for (const st of s.stops) {
       html += `<tr>
         <td>${st.station_name ?? st.station_uic ?? '?'}</td>
-        <td class="${delayClass(st.arrival_delay_minutes)}">${st.arrival_delay_minutes ?? '–'}</td>
-        <td class="${delayClass(st.departure_delay_minutes)}">${st.departure_delay_minutes ?? '–'}</td>
+        <td>${timeCell(st.arrival_time, st.arrival_delay_minutes)}</td>
+        <td>${timeCell(st.departure_time, st.departure_delay_minutes)}</td>
         <td>${platformBadge(st.arrival_platform && st.arrival_platform.status !== 'Unknown' ? st.arrival_platform : st.departure_platform)}</td>
       </tr>`;
     }
