@@ -28,9 +28,13 @@ it hasn't been re-run against the live multi-day VPS db yet, but no longer blind
 ## What TchouTchou is
 
 A French train intelligence platform: predictive reliability, live tracking, crowd
-insights, and deep-linking to SNCF Connect for booking. This pipeline is the data
-foundation underneath that — it doesn't build any product features yet, it collects
-and aggregates the raw material those features will need.
+insights, and deep-linking to SNCF Connect for booking. This pipeline (`tchoutchou_ingest/`)
+is the data foundation underneath that — it collects and aggregates the raw material those
+features need. **As of 2026-08-19, a first product layer exists**: `tchoutchou_api/`, a
+sibling folder with a FastAPI backend + minimal UI serving all four features (crowd
+insights is an honest "not available" stub — no data source for it yet). See
+`tchoutchou_api/README.md` for what's built, how to run it, and its "Known gaps" section
+before demoing it to anyone.
 
 ## What's built
 
