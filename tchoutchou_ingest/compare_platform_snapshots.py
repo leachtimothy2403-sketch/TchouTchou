@@ -85,6 +85,35 @@ def _parse_aimed(ts):
         return None
 
 
+def _short_cat(cat):
+    # 'FR:TypeOfProductCategory::regionalRail::' -> 'regionalRail'
+    if cat and "::" in cat:
+        parts = [p for p in cat.split("::") if p]
+        return parts[-1] if parts else cat
+    return cat
+
+
+def _train_label(train_type, service_code, product_category_ref):
+    """
+    Best available human-facing nomenclature for a train, in priority order:
+      1. train_type from GTFS-RT (TER, TGV INOUI, OUIGO, Intercites, ... -- parse.py's
+         SERVICE_CODE_INFO, only set at "high confidence", see that file).
+      2. the raw service_code, if GTFS-RT saw the train but parse.py doesn't map it yet
+         (ICN/TRN/NA, or one not in the current mapping at all).
+      3. SIRI's own product_category_ref (regionalRail, highSpeedRail, ...) -- coarser
+         than a brand name, but this is the ONLY signal available for a train GTFS-RT
+         never carried at all, which per CROSS_VALIDATION_STUCK_SUMMARY.md is common for
+         Transilien/RER-style suburban services.
+    """
+    if train_type:
+        return train_type
+    if service_code:
+        return f"service_code {service_code} (unmapped)"
+    if product_category_ref:
+        return _short_cat(product_category_ref)
+    return "type unknown"
+
+
 def spot_check_list(after_path, limit=10):
     """
     Prints confirmed-platform calls near the current time, for manual verification
@@ -101,15 +130,37 @@ def spot_check_list(after_path, limit=10):
     anything happening around the actual current time. Fixed to rank by closeness to now
     instead: upcoming calls first (soonest first), falling back to the most recently
     departed ones if nothing is upcoming.
+
+    NOTE (added 2026-08-19, same day): now also LEFT JOINs trip_updates to show a human
+    nomenclature (OUIGO, TER, ...) instead of a bare train number -- see _train_label().
+    Caveat when running this against a monitor_snapshot.py export specifically:
+    trip_updates is only a small recent-N-row SAMPLE in that file (see monitor_snapshot.py's
+    docstring), not the full table, so the join will often come up empty even for a train
+    GTFS-RT does carry -- that's expected, not a bug, and is exactly why the
+    product_category_ref fallback exists. Against the live tchoutchou.db (full
+    trip_updates) the join will succeed far more often.
+
+    trip_updates has one row per POLL, not one per train (no unique constraint on
+    commercial_train_number+start_date) -- joining directly fans out platform_calls rows
+    once per poll GTFS-RT happened to see that train. Grouped/deduped via a subquery
+    first (train_type/service_code are parsed once from trip_id and don't vary across
+    polls for the same train, so MAX() just picks the one consistent value).
     """
     conn = sqlite3.connect(f"file:{after_path}?mode=ro", uri=True)
     cur = conn.cursor()
     rows = cur.execute(
         "SELECT pj.train_number, pj.origin_name, pj.destination_name, pc.stop_point_name, "
         "pc.aimed_arrival_time, pc.arrival_platform_name, "
-        "pc.aimed_departure_time, pc.departure_platform_name "
+        "pc.aimed_departure_time, pc.departure_platform_name, "
+        "pj.product_category_ref, tu.train_type, tu.service_code "
         "FROM platform_calls pc JOIN platform_journeys pj "
         "  ON pj.train_number = pc.train_number AND pj.calendar_date = pc.calendar_date "
+        "LEFT JOIN ("
+        "  SELECT commercial_train_number, start_date, MAX(train_type) AS train_type, "
+        "         MAX(service_code) AS service_code "
+        "  FROM trip_updates GROUP BY commercial_train_number, start_date"
+        ") tu "
+        "  ON tu.commercial_train_number = pc.train_number AND tu.start_date = pc.calendar_date "
         "WHERE pc.arrival_platform_name IS NOT NULL OR pc.departure_platform_name IS NOT NULL"
     ).fetchall()
     conn.close()
@@ -118,7 +169,7 @@ def spot_check_list(after_path, limit=10):
 
     scored = []
     for row in rows:
-        tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat = row
+        tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat, cat, train_type, service_code = row
         aimed = _parse_aimed(aimed_arr) or _parse_aimed(aimed_dep)
         if aimed is None:
             continue
@@ -130,14 +181,15 @@ def spot_check_list(after_path, limit=10):
 
     print(f"\n{len(rows)} confirmed-platform calls near {now.isoformat(timespec='minutes')} "
           f"to spot-check against SNCF Connect / a real departure board:")
-    for (tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat) in rows:
+    for (tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat, cat, train_type, service_code) in rows:
         route = f"{origin or '?'} -> {dest or '?'}"
+        label = _train_label(train_type, service_code, cat)
         note = "  [mission code -- won't be searchable on SNCF Connect, check a Transilien/RATP live board instead]" \
             if tn and not tn.isdigit() and "-" not in tn else ""
         if arr_plat:
-            print(f"  Train {tn} ({route}): arrives {stop} at {aimed_arr} -- TchouTchou says platform {arr_plat}{note}")
+            print(f"  {label} train {tn} ({route}): arrives {stop} at {aimed_arr} -- TchouTchou says platform {arr_plat}{note}")
         if dep_plat:
-            print(f"  Train {tn} ({route}): departs {stop} at {aimed_dep} -- TchouTchou says platform {dep_plat}{note}")
+            print(f"  {label} train {tn} ({route}): departs {stop} at {aimed_dep} -- TchouTchou says platform {dep_plat}{note}")
 
 
 def main():
