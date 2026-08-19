@@ -76,7 +76,32 @@ def regression_check(before_path, after_path):
     return regressions
 
 
+def _parse_aimed(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
 def spot_check_list(after_path, limit=10):
+    """
+    Prints confirmed-platform calls near the current time, for manual verification
+    against SNCF Connect / a real departure board.
+
+    NOTE (found 2026-08-19): this used to ORDER BY aimed time DESC with no time filter --
+    that doesn't mean "most recently confirmed" or "happening soon", it means "the single
+    latest-scheduled timestamp anywhere in platform_calls". Since platform_calls holds
+    the full current+upcoming service day (upserted to final state, not append-only), the
+    max timestamp is always going to be that day's last services -- which, per
+    CROSS_VALIDATION_STUCK_SUMMARY.md's feed-scope finding, are disproportionately
+    Transilien/RER suburban trains running near/after midnight. That's why the list was
+    all late-night alphanumeric mission-code trains (NEMO50, KJZZ62, PERO56...) instead of
+    anything happening around the actual current time. Fixed to rank by closeness to now
+    instead: upcoming calls first (soonest first), falling back to the most recently
+    departed ones if nothing is upcoming.
+    """
     conn = sqlite3.connect(f"file:{after_path}?mode=ro", uri=True)
     cur = conn.cursor()
     rows = cur.execute(
@@ -85,19 +110,34 @@ def spot_check_list(after_path, limit=10):
         "pc.aimed_departure_time, pc.departure_platform_name "
         "FROM platform_calls pc JOIN platform_journeys pj "
         "  ON pj.train_number = pc.train_number AND pj.calendar_date = pc.calendar_date "
-        "WHERE pc.arrival_platform_name IS NOT NULL OR pc.departure_platform_name IS NOT NULL "
-        "ORDER BY COALESCE(pc.aimed_arrival_time, pc.aimed_departure_time) DESC LIMIT ?",
-        (limit,),
+        "WHERE pc.arrival_platform_name IS NOT NULL OR pc.departure_platform_name IS NOT NULL"
     ).fetchall()
     conn.close()
 
-    print(f"\n{len(rows)} confirmed-platform calls to spot-check against SNCF Connect / a real departure board:")
+    now = datetime.now().astimezone()  # local (server) time, to compare against aimed times that carry a UTC offset
+
+    scored = []
+    for row in rows:
+        tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat = row
+        aimed = _parse_aimed(aimed_arr) or _parse_aimed(aimed_dep)
+        if aimed is None:
+            continue
+        is_past = aimed < now
+        scored.append(((is_past, abs((aimed - now).total_seconds())), row))
+
+    scored.sort(key=lambda x: x[0])
+    rows = [row for _, row in scored[:limit]]
+
+    print(f"\n{len(rows)} confirmed-platform calls near {now.isoformat(timespec='minutes')} "
+          f"to spot-check against SNCF Connect / a real departure board:")
     for (tn, origin, dest, stop, aimed_arr, arr_plat, aimed_dep, dep_plat) in rows:
         route = f"{origin or '?'} -> {dest or '?'}"
+        note = "  [mission code -- won't be searchable on SNCF Connect, check a Transilien/RATP live board instead]" \
+            if tn and not tn.isdigit() and "-" not in tn else ""
         if arr_plat:
-            print(f"  Train {tn} ({route}): arrives {stop} at {aimed_arr} -- TchouTchou says platform {arr_plat}")
+            print(f"  Train {tn} ({route}): arrives {stop} at {aimed_arr} -- TchouTchou says platform {arr_plat}{note}")
         if dep_plat:
-            print(f"  Train {tn} ({route}): departs {stop} at {aimed_dep} -- TchouTchou says platform {dep_plat}")
+            print(f"  Train {tn} ({route}): departs {stop} at {aimed_dep} -- TchouTchou says platform {dep_plat}{note}")
 
 
 def main():

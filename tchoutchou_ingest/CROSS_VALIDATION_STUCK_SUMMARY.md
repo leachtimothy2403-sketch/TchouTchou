@@ -125,3 +125,80 @@ iterating on join-key theories one at a time, whether it's worth checking SIRI E
 actual documented scope/coverage before assuming it's a join bug, and — given this is a
 secondary validation/enrichment effort rather than something blocking the MVP — whether
 it's worth continuing to chase right now vs. parking it.
+
+## Outside advice received + validated against real data (2026-08-19)
+
+Got outside advice recommending exactly this: stop iterating on join-key theories, and
+instead split SIRI's `train_number` values into three structurally different buckets
+before computing any match rate —
+
+- **A. Direct numeric match** (SIRI `164405` vs GTFS-RT `164405`) — the only bucket where
+  an unmatched pair is a genuine mystery.
+- **B. Coupled-unit pairs** (`"126682-126683"`) — untested until now: match if *either*
+  half is in GTFS-RT, instead of treating the whole string as unmatchable.
+- **C. Alphanumeric mission codes** (`"UMOL09"`) — structurally can never match, not a bug.
+
+Then, for bucket A, compare `product_category_ref` distribution between matched and
+unmatched trains — a scope/semantics mismatch would show up as unmatched trains skewing
+toward regional/suburban categories, independent of any join-key bug.
+
+**New script**: `diagnose_feed_scope.py` implements this (buckets A/B/C, matched-vs-
+unmatched category comparison, top `line_name` values per bucket, and a `--window` option
+to pull SIRI journeys from neighboring calendar dates too, addressing the advice's point
+about checking contemporaneity without requiring the same poll timestamp on both sides).
+
+**Caveat on what was actually run**: the production VPS db (the one that produced this
+doc's 262/1,106/10,425 figures, accumulated over several days) wasn't available from this
+session — only local dev/test `.db` files were. The most useful one, `demo.db`, is a
+**single real day** (2026-08-17) of live-polled data, predating the 2026-08-18
+platform-layer schema migration (its `platform_journeys` is still the old append-only,
+one-row-per-poll design, not the new upsert-to-final-value one — the script dedupes
+defensively but this is worth knowing). So the *numbers* below are not directly
+comparable to the doc's headline figures and don't replace re-running this against the
+live VPS db. The *pattern* is what's informative.
+
+**Result, run against `demo.db` for 2026-08-17** (`python diagnose_feed_scope.py --db
+demo.db --window 0`):
+
+- Bucket A: 2,514/3,561 numeric trains matched directly (70.6%) — much higher than the
+  23.7% cited above. This alone suggests the production run's low rate isn't purely
+  structural (a single clean day joins far better), though it doesn't pin down why the
+  multi-day VPS number is lower — worth re-running this script against the live db to see
+  if the pattern holds or if something else is going on over longer windows.
+- The scope signature the advice predicted showed up clearly: matched numeric trains are
+  63.5% `regionalRail`, 9.4% `highSpeedRail`, 8.7% `suburbanRailway`; **unmatched** numeric
+  trains are 43.3% `local` + 40.5% `suburbanRailway` (84% combined) vs. 8.8% combined in
+  the matched set. Top `line_name` values for the unmatched bucket are almost entirely
+  single-letter Transilien codes (E, H, L, J, C, D, P — plus a few TER-style regional
+  routes). **Bucket C (alphanumeric mission codes) is 100% `suburbanRailway`, all
+  `line_name` A or B — i.e. RER A/B.**
+- Conclusion: the gap is overwhelmingly a **feed-scope/semantics difference (advice's A +
+  C), not a broken join** — this GTFS-RT proxy carries little of the Transilien/RER
+  suburban network that SIRI covers in depth, and that network partly uses
+  alphanumeric mission codes (RER A/B) that can't join at all even in principle.
+- Side finding while at it: cross-checking GTFS-RT's unmapped `service_code`s the same
+  way — `NA` (i.e. no service_code segment in `trip_id` at all) matched SIRI 283/311 times
+  (91%), and of those, 77% were `suburbanRailway`, with the rest split across
+  `regionalCoach`/`railReplacementCoach`/`highSpeedRail`/`international`. So `NA` isn't a
+  single clean category the way `ICN` is (16/16 `longDistance` in the original doc, 9/9
+  here) — it looks like "no distinct commercial brand in the trip_id," a grab-bag skewed
+  toward Transilien-adjacent + coach services, not one train_type. Recommend **not**
+  forcing `NA` into a single `parse.py` label; `ICN` → "Intercités de Nuit" still looks
+  solid and safe to add. `TRN` sample was too small here (n=2, both `longDistance`,
+  consistent with the doc's existing lean but not enough to confirm on its own).
+
+**Recommendation**: park the deep join-mechanics chase, per the advice's framing — this
+looks like A (scope) + C (semantics), not B (a bug). Concrete next actions instead of more
+join-key iteration:
+1. Add `ICN` → "Intercités de Nuit" to `parse.py` (already had 16/16, now 9/9 elsewhere —
+   solid).
+2. Add either-half matching for coupled-unit pairs to `cross_validate_train_type.py` (cheap,
+   was untested — bucket B here matched 26/80, i.e. it's a real, if modest, win).
+3. Re-run `diagnose_feed_scope.py --window 1` against the live VPS db once convenient, to
+   confirm the same pattern holds at production scale and to see whether the 23.7% vs
+   70.6% match-rate gap between the two runs is itself telling (e.g. does match rate drop
+   as the SIRI-side date range widens, suggesting something date/staleness-related after
+   all?) — but this is a nice-to-have, not a blocker.
+4. Leave `TRN`/`NA` unresolved rather than guessing further; there's no MVP dependency on
+   them (see original doc's point 7 above), and `NA` in particular doesn't look like it
+   decodes to one clean label no matter how much more data arrives.

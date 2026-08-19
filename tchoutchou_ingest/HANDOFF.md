@@ -17,10 +17,13 @@ definitions exist. Two things actively in progress: (1) validating
 the new SIRI upsert logic against real traffic before dropping its raw_gzip safety net
 (see "SIRI upsert validation" below — first spot-check round done, 2/2 correct, second
 round pending), and (2) cross-validating `service_code`→`train_type` against SIRI's
-`line_name`/`product_category_ref` to decode the unmapped codes — currently **stuck** on
-an unexplained low join-match-rate; a summary was written for outside advice
-(`CROSS_VALIDATION_STUCK_SUMMARY.md`) and hasn't been resolved yet (see "Train-type
-cross-validation" below).
+`line_name`/`product_category_ref` to decode the unmapped codes — was **stuck** on an
+unexplained low join-match-rate; a summary was written for outside advice
+(`CROSS_VALIDATION_STUCK_SUMMARY.md`), and that advice (plus a first validation pass
+against real single-day data, new script `diagnose_feed_scope.py`) now points to a
+feed-scope/semantics explanation rather than a broken join — **not fully closed**, since
+it hasn't been re-run against the live multi-day VPS db yet, but no longer blind (see
+"Train-type cross-validation" below).
 
 ## What TchouTchou is
 
@@ -94,7 +97,8 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
 | `compare_platform_snapshots.py` | Diffs two `monitor_snapshot.py` exports to catch silent platform-data regressions (a confirmed platform going blank, or recorded→estimated) in the new SIRI upsert logic, plus a spot-check list for manual verification against reality. See "SIRI upsert validation" below. |
 | `cross_validate_train_type.py` | Joins `trip_updates`/`platform_journeys` on train_number+date to cross-check `service_code`-derived `train_type` against SIRI's `line_name`/`product_category_ref` — decodes currently-unmapped codes (`ICN`/`TRN`/`NA`) from real traffic and flags already-mapped codes with inconsistent `product_category_ref` (not `line_name` — see script docstring for why). Currently blocked on a low join-match-rate mystery, see `CROSS_VALIDATION_STUCK_SUMMARY.md`. |
 | `check_mission_codes.py` | One-off diagnostic run while debugging the cross-validation join above: splits `platform_journeys.train_number` values that aren't plain digits into coupled-unit pairs (e.g. `"126682-126683"`) vs true alphanumeric mission codes (e.g. `"UMOL09"`, RER/Transilien style) — the latter can never join against GTFS-RT's `commercial_train_number`, confirmed always pure-digit. |
-| `CROSS_VALIDATION_STUCK_SUMMARY.md` | Write-up of the train-type cross-validation investigation (see "Train-type cross-validation" below) for getting a second opinion — what we're trying to do, four join-key attempts and what each ruled in/out, and where it's stuck. Written 2026-08-19, not yet resolved. |
+| `CROSS_VALIDATION_STUCK_SUMMARY.md` | Write-up of the train-type cross-validation investigation (see "Train-type cross-validation" below) for getting a second opinion — what we're trying to do, four join-key attempts and what each ruled in/out, and where it was stuck. Written 2026-08-19; updated same day with outside advice received and a first validation pass against real data (see "Outside advice received + validated against real data" section in that file). |
+| `diagnose_feed_scope.py` | Splits SIRI `platform_journeys.train_number` into numeric / coupled-pair / alphanumeric buckets before computing any match rate against `trip_updates`, and compares `product_category_ref` distribution between matched and unmatched trains — answers "is the join gap a bug, a feed-scope difference, or a train-identity semantics difference?" Run this before trusting `cross_validate_train_type.py`'s numbers. See "Train-type cross-validation" below. |
 | `find_examples.py`, `stats.py`, `peek.py`, `validate_extraction.py` | Ad hoc exploration/validation scripts used during development, not part of the running pipeline. |
 | `getplatform.py`, `testsncf.py` | Original exploration scripts (yours) that the pipeline grew out of. Kept for reference. |
 | `requirements.txt` | `requests`, `gtfs-realtime-bindings` — the only two non-stdlib dependencies. |
@@ -152,12 +156,24 @@ Full architecture, schema, and reasoning is in `README.md` — this doc is the s
      (2026-08-19, overnight/thin traffic): 2/2 correct — train UMOL09 (RER A) and
      164405 (Transilien N) both matched reality. Re-run planned during daytime service
      for a larger sample.
+     **Bug found and fixed (2026-08-19, second round)**: `spot_check_list()` ordered
+     confirmed calls by `aimed_arrival/departure_time DESC` with no time filter — since
+     `platform_calls` holds the whole current+upcoming service day (upserted, not
+     append-only), that always surfaces whatever's scheduled *latest that day*, i.e. the
+     last services before/after midnight, which are disproportionately Transilien/RER
+     mission-code trains (see `CROSS_VALIDATION_STUCK_SUMMARY.md`'s feed-scope finding —
+     that's not a coincidence). A live run against a fresh VPS snapshot returned nothing
+     but late-night NEMO50/KJZZ62/PERO56-style trains, useless for spot-checking against
+     *right now*. Fixed to rank by closeness to the current time instead (soonest
+     upcoming first, falling back to most-recently-departed); also now flags
+     alphanumeric mission-code trains inline since SNCF Connect can't look them up (need
+     a Transilien/RATP live board instead). Needs a `git pull` on the VPS to pick up.
   Once this has run clean for a while, drop SIRI's raw blob (bigger win than GTFS-RT's,
   see blob-share numbers above); keep GTFS-RT's regardless since it still has full poll
   history in `trip_updates`/`stop_time_updates` and the blob there is a cheaper,
   lower-stakes safety net.
 
-## Train-type cross-validation (in progress, stuck as of 2026-08-19)
+## Train-type cross-validation (in progress, redirected as of 2026-08-19)
 
 Goal: join `trip_updates` and `platform_journeys` on train number (+ date) to decode the
 three unmapped GTFS-RT `service_code`s (`ICN`, `TRN`, `NA`) using SIRI's `line_name`/
@@ -199,9 +215,29 @@ single dominant `product_category_ref` each — those existing mappings look sol
 conventional track). `TRN`/`NA` — the two codes we most wanted to decode — still don't
 have enough matched samples to conclude anything.
 
-Full writeup with reasoning for each attempt: `CROSS_VALIDATION_STUCK_SUMMARY.md`
-(written 2026-08-19 to get a second opinion from elsewhere — check whether that produced
-any new direction before re-attempting this from scratch).
+**What changed (2026-08-19, same day)**: outside advice on this write-up recommended
+splitting SIRI's `train_number` into three buckets before computing any match rate at
+all — direct numeric, coupled-unit pairs (untested: match via either half), and
+alphanumeric mission codes (structurally unmatchable) — then comparing
+`product_category_ref` distribution between matched and unmatched numeric trains as the
+real diagnostic, instead of iterating on join-key theories. New script
+`diagnose_feed_scope.py` implements this. A first pass against one real day of data
+(`demo.db`, 2026-08-17 — not the multi-day production VPS db these match-rate figures
+were originally computed from, see the caveat in `CROSS_VALIDATION_STUCK_SUMMARY.md`)
+found exactly the predicted signature: unmatched numeric trains are 84% `local`/
+`suburbanRailway` vs. 9% in matched trains, and unmatched `line_name`s are dominated by
+single-letter Transilien codes (E/H/L/J/C/D/P); the alphanumeric mission-code bucket is
+100% `suburbanRailway`, `line_name` A or B (RER A/B). **Reframed conclusion: this looks
+like a feed-scope/semantics difference, not a broken join** — worth confirming at
+production scale (re-run `diagnose_feed_scope.py --window 1` against the live VPS db)
+but no longer worth more join-key iteration. Side finding: `NA` (no `service_code`
+segment in `trip_id`) matched SIRI 91% of the time but isn't one clean category (77%
+`suburbanRailway`, rest split across coach/high-speed/international) — don't force it
+into a single `parse.py` label. `ICN` → "Intercités de Nuit" held up again (9/9
+`longDistance` in this sample, 16/16 before) and is safe to add to `parse.py` now.
+
+Full writeup with reasoning for each attempt, the outside advice received, and the
+validation pass above: `CROSS_VALIDATION_STUCK_SUMMARY.md`.
 
 ## What's NOT done yet
 
@@ -209,10 +245,12 @@ any new direction before re-attempting this from scratch).
   `platform_lead_time_stats`, even though it's derivable (deliberately, to avoid an
   ALTER TABLE mid-collection). Add it once you actually need to query platform stats by
   station rather than by raw `stop_point_ref`.
-- **`product_category_ref` cross-validation is in progress but stuck** — see "Train-type
-  cross-validation" above and `CROSS_VALIDATION_STUCK_SUMMARY.md`. Not simply "not
-  started" anymore; there's real partial progress (ICN decoded, TER/CTE/IC confirmed
-  solid) blocked on an unexplained low join-match-rate.
+- **`product_category_ref` cross-validation has real partial progress but isn't fully
+  closed** — see "Train-type cross-validation" above and `CROSS_VALIDATION_STUCK_SUMMARY.md`.
+  ICN decoded (add to `parse.py`), TER/CTE/IC confirmed solid, and the low join-match-rate
+  mystery is now believed to be feed scope/semantics (Transilien/RER coverage difference)
+  rather than a bug — still worth a `diagnose_feed_scope.py` run against the live VPS db
+  to confirm at production scale before fully closing this out.
 - **True cancellation detection** — `cancelled_count` only counts trips GTFS-RT
   explicitly marked `CANCELED`. A train that never appears in the feed at all looks
   identical to "wasn't scheduled today" without cross-referencing the static
@@ -398,10 +436,20 @@ from the original 90. Revisit upward if/once disk headroom improves (bigger volu
 4. Let it run **2-4 weeks minimum** before treating any punctuality number as
    meaningful — a day or two of data just checks the pipeline survives unattended, it
    doesn't smooth out one-off disruptions (strikes, engineering works, weather).
-5. Resume the train-type cross-validation (see "Train-type cross-validation" above) —
-   check `CROSS_VALIDATION_STUCK_SUMMARY.md` for whether outside advice produced a new
-   direction before re-attempting the low-match-rate mystery from scratch. Once
-   unblocked: finish decoding `TRN`/`NA`, add `ICN` → likely "Intercités de Nuit" to
-   `parse.py` (already has a clean 16/16 signal, just needs applying), and add the
-   `station_uic` column to the platform tables once there's real history to query by
-   station.
+5. Train-type cross-validation (see "Train-type cross-validation" above) — outside
+   advice plus a first validation pass already redirected this from "stuck on a join
+   bug" to "likely feed scope/semantics"; see `CROSS_VALIDATION_STUCK_SUMMARY.md`. Concrete
+   remaining steps, in order:
+   a. Add `ICN` → "Intercités de Nuit" to `parse.py` — safe now, confirmed twice (16/16,
+      then 9/9).
+   b. Add either-half matching for coupled-unit pairs (`"126682-126683"`) to
+      `cross_validate_train_type.py` — cheap, was untested, recovered 26/80 in the sample
+      run.
+   c. Re-run `diagnose_feed_scope.py --window 1` against the live VPS db to confirm the
+      scope-mismatch pattern holds at production scale (single-day local test showed
+      70.6% numeric match rate vs. the doc's 23.7% production figure — worth
+      understanding that gap even if the qualitative conclusion doesn't change).
+   d. Leave `TRN`/`NA` unresolved rather than force a label — `NA` in particular looks
+      like a grab-bag, not one clean category, even with more data.
+   e. Add the `station_uic` column to the platform tables once there's real history to
+      query by station.
