@@ -186,17 +186,54 @@ def process_trip(cur, trip_id, start_date):
     # arrival_time/departure_time instead (absolute epoch seconds, always present, and
     # monotonically increasing along the route) avoids depending on a field that isn't
     # actually there.
+    #
+    # A single poll can also legitimately report the SAME stop_id twice with conflicting
+    # delay values (confirmed against real data 2026-08-23 -- train 117137/20260819,
+    # station 87113001: two stop_time_update rows in the identical snapshot, adjacent in
+    # the list, with the IDENTICAL departure_time but departure_delay 420 vs 0. Ruled
+    # out both a coupled-unit vehicle -- single trip_update entity, single vehicle_id --
+    # and a genuine second route visit -- same departure_time can't be two real events.
+    # Most likely an upstream feed-provider merge artifact.). Resolution below happens
+    # in two passes: (1) collapse same-snapshot duplicates per stop_id, keeping
+    # whichever arrival/departure pair has the LARGER delay, so a spurious low duplicate
+    # can never silently override an already-confirmed higher one; (2) across different
+    # polls, take the latest snapshot's value PER FIELD independently (not a whole-tuple
+    # overwrite), so a later poll that happens to omit one field (e.g. departure already
+    # happened and dropped out of "predicted" fields while arrival to the next stop
+    # hasn't) can't erase an earlier poll's real value for that field.
     cur.execute(
-        "SELECT stu.stop_id, stu.arrival_delay, stu.arrival_time, stu.departure_delay, stu.departure_time "
+        "SELECT s.id, s.fetched_at_utc, stu.stop_id, stu.arrival_delay, stu.arrival_time, "
+        "stu.departure_delay, stu.departure_time "
         "FROM stop_time_updates stu "
         "JOIN trip_updates tu ON tu.id = stu.trip_update_id "
         "JOIN snapshots s ON s.id = tu.snapshot_id "
-        "WHERE tu.trip_id=? AND tu.start_date=? ORDER BY s.fetched_at_utc ASC",
+        "WHERE tu.trip_id=? AND tu.start_date=? ORDER BY s.fetched_at_utc ASC, s.id ASC",
         (trip_id, start_date),
     )
+    per_snapshot = {}  # (snap_id, stop_id) -> [arrival_delay, arrival_time, departure_delay, departure_time]
+    snapshot_order = []  # (fetched_at_utc, snap_id, stop_id), ascending, one entry per first-seen key
+    for snap_id, fetched_at, stop_id, arrival_delay, arrival_time, departure_delay, departure_time in cur.fetchall():
+        key = (snap_id, stop_id)
+        if key not in per_snapshot:
+            per_snapshot[key] = [arrival_delay, arrival_time, departure_delay, departure_time]
+            snapshot_order.append((fetched_at, snap_id, stop_id))
+        else:
+            cv = per_snapshot[key]
+            if departure_delay is not None and (cv[2] is None or departure_delay > cv[2]):
+                cv[2], cv[3] = departure_delay, departure_time
+            if arrival_delay is not None and (cv[0] is None or arrival_delay > cv[0]):
+                cv[0], cv[1] = arrival_delay, arrival_time
+
     final_by_stop = {}
-    for stop_id, arrival_delay, arrival_time, departure_delay, departure_time in cur.fetchall():
-        final_by_stop[stop_id] = (arrival_delay, arrival_time, departure_delay, departure_time)
+    for fetched_at, snap_id, stop_id in snapshot_order:
+        arrival_delay, arrival_time, departure_delay, departure_time = per_snapshot[(snap_id, stop_id)]
+        cv = final_by_stop.get(stop_id, (None, None, None, None))
+        final_by_stop[stop_id] = (
+            arrival_delay if arrival_delay is not None else cv[0],
+            arrival_time if arrival_time is not None else cv[1],
+            departure_delay if departure_delay is not None else cv[2],
+            departure_time if departure_time is not None else cv[3],
+        )
 
     if not final_by_stop:
         cur.execute(
