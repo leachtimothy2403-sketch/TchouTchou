@@ -36,6 +36,18 @@ from pathlib import Path
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+-- Caps how large the -wal file is allowed to stay after a checkpoint (2026-08-23,
+-- after the -wal file was found to have grown to ~6.8GB and stayed there indefinitely:
+-- a normal PASSIVE/auto checkpoint resets the WAL's internal pointer but does NOT
+-- shrink the file on disk -- only a TRUNCATE-mode checkpoint does, and nothing was
+-- ever triggering one. This makes SQLite auto-truncate back down to (approximately)
+-- this limit after every checkpoint going forward, instead of the file silently
+-- sitting at its historical peak size forever. 64MB is comfortably above the
+-- ~3.9MB default auto-checkpoint threshold (wal_autocheckpoint=1000 pages) so it
+-- doesn't fight normal operation, while still bounding worst-case waste from a
+-- future write burst (e.g. another schema migration like 2026-08-18's). See
+-- check_wal.py for the diagnostic that found this.
+PRAGMA journal_size_limit=67108864;
 
 -- One row per HTTP poll of a given feed (trip_updates or service_alerts).
 -- raw_gzip holds the entire, untouched protobuf response: our insurance policy
