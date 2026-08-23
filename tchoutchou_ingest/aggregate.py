@@ -436,35 +436,74 @@ def main():
     ap.add_argument("--commit-every", type=int, default=200)
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
+    # timeout=30 matches db.py's connect() (used by ingest.py) -- this script previously
+    # used sqlite3's 5-second default, which is far too short given ingest.py's writer
+    # is live the whole time this runs (tens of minutes to hours over tens of thousands
+    # of trips). Under the old default, a single lock-contention hiccup raised
+    # sqlite3.OperationalError: database is locked and crashed the ENTIRE run,
+    # silently rolling back every trip processed since the last commit (2026-08-22
+    # incident: crashed after just 200/22544 trips). 30s gives SQLite's own busy-retry
+    # loop room to wait out ingest.py's brief writes instead of giving up immediately.
+    conn = sqlite3.connect(args.db, timeout=30)
     cur = conn.cursor()
 
     candidates = find_candidate_trips(conn, args.min_age_days)
     print(f"{len(candidates)} trip(s) ready to aggregate "
           f"(start_date more than {args.min_age_days} day(s) old, not yet processed).")
 
+    # Each trip's work is wrapped in its own SAVEPOINT so a failure on ONE trip (a
+    # lock-timeout that still exceeds 30s, a data anomaly, anything unexpected) rolls
+    # back just that trip's partial inserts and moves on, instead of raising an
+    # uncaught exception that kills the whole run and silently discards every trip
+    # processed since the last commit. A skipped trip never reaches its
+    # aggregation_state INSERT (that's always the last statement in process_trip()), so
+    # it's correctly retried on the next run rather than lost or half-recorded.
     processed = 0
+    errors = 0
     for trip_id, start_date in candidates:
-        process_trip(cur, trip_id, start_date)
+        cur.execute("SAVEPOINT trip_sp")
+        try:
+            process_trip(cur, trip_id, start_date)
+        except Exception as exc:
+            cur.execute("ROLLBACK TO trip_sp")
+            cur.execute("RELEASE trip_sp")
+            errors += 1
+            print(f"  ERROR processing trip_id={trip_id} start_date={start_date}: {exc} "
+                  f"-- skipped, will retry next run")
+            continue
+        cur.execute("RELEASE trip_sp")
         processed += 1
         if processed % args.commit_every == 0:
             conn.commit()
             print(f"  ...{processed}/{len(candidates)}")
     conn.commit()
-    print(f"Done. Aggregated {processed} trip(s).")
+    print(f"Done. Aggregated {processed} trip(s)."
+          + (f" {errors} trip(s) hit an error and were skipped for retry next run." if errors else ""))
 
     platform_candidates = find_platform_candidate_trips(conn, args.min_age_days)
     print(f"{len(platform_candidates)} platform journey(s) ready to aggregate.")
 
     platform_processed = 0
+    platform_errors = 0
     for train_number, calendar_date in platform_candidates:
-        process_platform_trip(cur, train_number, calendar_date)
+        cur.execute("SAVEPOINT trip_sp")
+        try:
+            process_platform_trip(cur, train_number, calendar_date)
+        except Exception as exc:
+            cur.execute("ROLLBACK TO trip_sp")
+            cur.execute("RELEASE trip_sp")
+            platform_errors += 1
+            print(f"  ERROR processing train_number={train_number} calendar_date={calendar_date}: {exc} "
+                  f"-- skipped, will retry next run")
+            continue
+        cur.execute("RELEASE trip_sp")
         platform_processed += 1
         if platform_processed % args.commit_every == 0:
             conn.commit()
             print(f"  ...{platform_processed}/{len(platform_candidates)}")
     conn.commit()
-    print(f"Done. Aggregated {platform_processed} platform journey(s).")
+    print(f"Done. Aggregated {platform_processed} platform journey(s)."
+          + (f" {platform_errors} journey(s) hit an error and were skipped for retry next run." if platform_errors else ""))
 
     conn.close()
 
