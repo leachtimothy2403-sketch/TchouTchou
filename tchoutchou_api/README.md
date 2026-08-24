@@ -64,23 +64,14 @@ SNCF rather than being built here (see the monetization/MVP discussion,
    `set SNCF_API_KEY=your-key-here` (PowerShell: `$env:SNCF_API_KEY = "your-key-here"`).
 3. Try it: `http://localhost:8000/api/search?from=Paris+Gare+de+Lyon&to=Lyon+Part-Dieu&date=2026-08-26&time=18:00`
 
-**This has not been tested against a real key yet** -- `sncf_journeys.py` was written
-from SNCF's/Navitia's public documentation, not from a live call (no key was available
-while building it). Two specific things need checking against a real response, both
-flagged with `IMPORTANT` comments in `sncf_journeys.py`:
-- the coverage id `"sncf"` -- documented convention, not confirmed against `GET
-  /v1/coverage`;
-- where the commercial train number (e.g. "6683") actually lives in the response --
-  `_extract_train_number()` guesses `headsign` first, then `code`.
-
-**Once you have a key, the fastest way to find and fix any mismatch**: run one real
-`/api/search` request, and if `train_number` comes back null, or looks like a station
-name instead of a number, or reliability data isn't matching up, paste me the raw SNCF
-response for one journey (or the error) and I'll correct the field mapping precisely
-instead of guessing further. A first-pass local check (parsing + connection-risk math
-against a hand-built response, no key needed) already passed -- see `test_search_local.py`
--- so the remaining risk is specifically in how SNCF's real coverage names things, not in
-the overall logic.
+**Confirmed against a real key 2026-08-24** (Paris Gare de Lyon -> Lyon Part-Dieu): both
+previously-unverified assumptions in `sncf_journeys.py` turned out correct --
+coverage id `"sncf"` works, and `headsign` holds the plain train number directly (e.g.
+`"6669"`). No field-mapping fix was needed. That real response did surface one actual
+bug, since fixed -- see "Known gaps" below: an RER/Transilien leg's `headsign` is a
+mission code, not a train number, so it never gets reliability history, and a transfer
+right after one used to silently show the whole itinerary's combined probability as a
+false 100%. It now correctly comes back as unknown (`null`) instead.
 
 **Journey-search API results are cached in-memory for 5 minutes**, bucketed to the
 nearest 15-minute departure window, to protect the 5,000/day free tier under repeat
@@ -127,8 +118,15 @@ SNCF (digital@sncf.fr) before this is public-facing.
   VPS.
 - **No auth, no rate limiting, no HTTPS.** Fine for local/internal use; needs work before
   this is public-facing.
-- **`/api/search` untested against a real SNCF API response** -- see "SNCF journey search
-  setup" above for exactly what's inferred vs. confirmed.
+- **No reliability data for RER/Transilien (mission-code) legs.** Their `headsign` is a
+  mission code (e.g. `"QIDO"`), not a numeric train number, so `_extract_train_number()`
+  correctly returns `null` for them -- meaning that leg's `reliability` is always `null`,
+  and any transfer right after one has unknown connection risk. `combined_success_probability`
+  for such itineraries now correctly comes back `null` (see the bug fix above) rather than
+  the old false 100%, but there's still no actual reliability number for these legs, since
+  this pipeline doesn't have a data source keyed on mission codes today. Closing this would
+  mean joining against the SIRI-based mission-code tracking `main.py`'s `/status` endpoint
+  already does for platforms -- a real feature, not a quick fix.
 - **The end-to-end connection probability is a first-pass estimate**, not the full
   historical buffer-time model from the product design discussion -- it's based on one
   leg's overall delay-bucket history (how often has this train been at least N minutes

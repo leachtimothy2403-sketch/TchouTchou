@@ -10,27 +10,26 @@ https://numerique.sncf.com/startup/api/token-developpeur/ (free tier: 5,000 requ
 data covers roughly yesterday through 23 days ahead) and set it as the SNCF_API_KEY
 environment variable before using /api/search.
 
-IMPORTANT -- what's confirmed vs. inferred (read this before debugging a field-mapping
-issue). This module was written from SNCF's/Navitia's PUBLIC documentation
-(doc.navitia.io, digital.sncf.com, the SNCFdevelopers integration guide), not from a live
-test call -- no API key was available while writing it. Two things specifically are
-best-effort, not verified:
+CONFIRMED against a real response 2026-08-24 (Paris Gare de Lyon -> Lyon Part-Dieu,
+2026-08-26): both things that were previously best-effort guesses from public docs are
+now verified correct, no changes needed:
 
-  1. The coverage id "sncf" below -- the conventional, documented id for SNCF's national
-     rail coverage, but not confirmed by actually calling GET /v1/coverage and checking
-     it's in the list.
-  2. Where the commercial train number (e.g. "6683") actually lives in a journey's
-     display_informations -- several independent Navitia/SNCF integrations put it in
-     `headsign`, but this hasn't been checked against a real response for this coverage.
-     `_extract_train_number()` below tries a couple of candidate fields; if train numbers
-     come back wrong, blank, or as something like "Paris" instead of a number once you
-     have a real key, that function is the first place to look. Paste me one real
-     /journeys response (or point me at SNCF_API_KEY on your machine) and I'll fix the
-     mapping precisely instead of guessing further.
+  1. The coverage id "sncf" below -- confirmed working (real journeys came back).
+  2. Where the commercial train number lives -- confirmed: `headsign` holds the plain
+     train number directly (e.g. "6669", "6689", "7805", "9844"), exactly the first
+     candidate `_extract_train_number()` already tried.
+
+One real gap this DID surface, now fixed in main.py's `_combined_probability()`: an RER/
+Transilien leg's `headsign` is a mission code (e.g. "QIDO"), not a train number, so
+`_extract_train_number()` correctly returns None for it -- but that means such a leg
+never gets reliability history, so any transfer right after it has unknown connection
+risk. The end-to-end combined probability now correctly comes back as unknown (None) in
+that case instead of silently showing 100%; see main.py for the fix and
+test_search_local.py check #7 for the regression test. Still open: no reliability data
+source at all for mission-code/RER legs (a bigger feature, not a bug -- see README.md).
 
 The overall Navitia response shape (journeys/sections/stop_date_times) is long-
-established, widely-used public API surface, so that part is on firmer ground than the
-two SNCF-specific details above.
+established, widely-used public API surface, confirmed by the real response above too.
 """
 import os
 import re

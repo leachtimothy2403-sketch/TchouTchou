@@ -453,34 +453,44 @@ def _combined_probability(legs, transfers):
     NOT the product of each leg's independent on-time percentage -- see the product
     design discussion (tchoutchou_monetization_mvp.md) on why that both misstates the
     real question (making the connection vs. each train individually being on time) and
-    ignores correlated delays. Returns (probability_pct_or_None, list_of_notes)."""
+    ignores correlated delays. Returns (probability_pct_or_None, list_of_notes).
+
+    BUG FIXED 2026-08-24, found from a real SNCF response: an itinerary with an RER leg
+    into a 4-minute transfer at Marne-la-Vallee-Chessy (RER legs never get a train_number,
+    see sncf_journeys.py's _extract_train_number(), so there's no reliability history to
+    estimate that transfer from) was coming back with combined_success_probability=100.0
+    -- identical to a guaranteed direct train. The old code treated "unknown connection
+    risk" as "skip this factor" (multiply by 1, i.e. certainty), which is backwards: a
+    transfer we have zero data on is the LEAST certain thing in the itinerary, not the
+    most. Now any transfer with an unknown connection-success probability makes the whole
+    itinerary's combined probability None (unknown) rather than silently assuming success.
+    """
     if not legs:
         return None, []
 
     notes = []
     p = 1.0
-    have_any = False
 
     for t in transfers:
         if t["connection_success_probability"] is None:
             if t.get("note"):
                 notes.append(t["note"])
-            continue
-        have_any = True
+            return None, notes
         p *= t["connection_success_probability"] / 100
 
+    have_cancellation_data = False
     last_leg_reliability = legs[-1]["reliability"]
     if last_leg_reliability and last_leg_reliability.get("available"):
         overall = last_leg_reliability.get("overall") or {}
         obs = overall.get("observations")
         cancelled = overall.get("cancelled_count")
         if obs:
-            have_any = True
+            have_cancellation_data = True
             p *= 1 - (cancelled / obs)
     else:
         notes.append("No reliability/cancellation history yet for the final train.")
 
-    if not have_any:
+    if not transfers and not have_cancellation_data:
         return None, notes
     return round(p * 100, 1), notes
 
@@ -526,12 +536,14 @@ def search(
     a plain-English reason if the SNCF API call fails (missing/bad key, quota exhausted,
     unreachable, or an unknown station name) rather than a bare stack trace.
 
-    KNOWN GAP, same caveat as sncf_journeys.py's module docstring: this hasn't been
-    exercised against a real SNCF API response yet (no key was available while building
-    it) -- the journey/section shape is well-established Navitia surface, but exactly
-    where the commercial train number lives in SNCF's own coverage is inferred, not
-    confirmed. If train_number comes back null or wrong for real results, that's the
-    first thing to check (sncf_journeys.py's _extract_train_number()).
+    CONFIRMED against a real response 2026-08-24 -- see sncf_journeys.py's module
+    docstring. train_number extraction is correct. One real gap that run surfaced (now
+    fixed): an RER/Transilien leg has no train_number (its headsign is a mission code,
+    not a number), so it never has reliability history -- any transfer right after one
+    used to silently show as 100% success. combined_success_probability for such
+    itineraries now correctly comes back as null (unknown) instead. Legs still have
+    reliability: null in that case -- there's just no data source for mission-code trains
+    yet (a bigger feature than this fix; see README.md "Known gaps").
     """
     try:
         journeys = sncf_journeys.search_journeys(from_, to, date, time, count=count)

@@ -122,4 +122,20 @@ expected = round(0.85 * (1 - 2 / 100) * 100, 1)  # transfer success * (1 - final
 assert combined == expected, (combined, expected)
 print("combined probability: OK ->", combined, "% (expected", expected, "%)")
 
+# 7. Regression check for the 2026-08-24 bug: a transfer with UNKNOWN connection risk
+# (e.g. an incoming RER leg with no train_number, so no reliability history) must make
+# the whole itinerary's combined probability None/unknown, NOT silently 100%. Found from
+# a real SNCF response where an RER->TGV change at Marne-la-Vallee-Chessy came back
+# showing combined_success_probability=100.0 despite an explicit "no history" note.
+legs_unknown_transfer = [
+    {"reliability": None, "train_number": None},  # RER leg: no train_number -> no reliability
+    {"reliability": fake_reliability(on_time=88, late5=12, late15=4, late30=1, cancelled=0, obs=6),
+     "train_number": "9844"},
+]
+transfers_unknown = [{"connection_success_probability": None, "note": "No reliability history yet for the incoming train."}]
+combined2, notes2 = m._combined_probability(legs_unknown_transfer, transfers_unknown)
+assert combined2 is None, combined2  # must NOT be 100.0
+assert notes2 == ["No reliability history yet for the incoming train."], notes2
+print("combined probability (unknown transfer): OK -> correctly None, not a false 100%")
+
 print("\nALL LOCAL CHECKS PASSED")
