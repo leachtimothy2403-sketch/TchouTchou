@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrainAware search — TchouTchou</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --border: rgba(11,11,11,0.08);
+    --input-border: rgba(11,11,11,0.10);
+    --ink: #17181c;
+    --muted: #5b5d66;
+    --faint: #898781;
+    --accent: #3454d1;
+    --accent-dark: #2c47b8;
+    --accent-tint: #f4f6fd;
+    --good: #0ca30c;      --good-tint: rgba(12,163,12,0.10);
+    --warning: #c98500;   --warning-tint: rgba(201,133,0,0.12);
+    --serious: #ec835a;   --serious-tint: rgba(236,131,90,0.15);
+    --critical: #d03b3b;  --critical-tint: rgba(208,59,59,0.10);
+    --unknown: #5b5d66;   --unknown-tint: rgba(91,93,102,0.08);
+    --divider: #e1e0d9;
+    --error: #d03b3b;     --error-tint: rgba(208,59,59,0.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 480px; margin: 0 auto; padding-bottom: 48px; }
+
+  /* Brand strip */
+  .brand { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:16px 20px 6px; }
+  .brand-left { display:flex; align-items:center; gap:8px; }
+  .brand-left span { font-family:'Space Grotesk', system-ui, sans-serif; font-weight:700; font-size:16px; letter-spacing:-0.01em; }
+  .brand a.nav-link { font-size:12.5px; font-weight:600; text-decoration:none; }
+
+  /* Search summary / form */
+  .search-section { padding: 10px 20px 14px; }
+  .search-summary {
+    display:flex; align-items:center; justify-content:space-between;
+    background: var(--card); border:1px solid var(--border); border-radius:16px;
+    padding:14px 16px; cursor:pointer; box-shadow:0 1px 2px rgba(11,11,11,0.04);
+  }
+  .search-summary-left { display:flex; align-items:center; gap:10px; min-width:0; }
+  .search-summary-route { font-family:'Space Grotesk', system-ui, sans-serif; font-weight:600; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .search-summary-sub { font-size:12.5px; color:var(--muted); margin-top:2px; }
+  .chevron { flex-shrink:0; transition:transform 0.2s ease; color: var(--muted); }
+  .chevron.open { transform:rotate(180deg); }
+
+  .search-form {
+    background: var(--card); border:1px solid var(--border); border-top:none;
+    border-radius:0 0 16px 16px; margin-top:-8px; padding:20px 16px 16px;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .search-form label { font-size:11.5px; font-weight:600; color:var(--faint); text-transform:uppercase; letter-spacing:0.04em; }
+  .search-form input {
+    font-family:'IBM Plex Sans', system-ui, sans-serif; font-size:14px; color:var(--ink);
+    background: var(--bg); border:1px solid var(--input-border); border-radius:10px;
+    padding:10px 12px; width:100%; outline:none;
+  }
+  .search-form input:focus { border-color: var(--accent); background: #fff; }
+  .swap-row { display:flex; justify-content:flex-end; margin:-6px 0; }
+  .swap-btn {
+    background: var(--bg); border:1px solid var(--input-border); border-radius:8px;
+    width:30px; height:30px; display:flex; align-items:center; justify-content:center;
+    cursor:pointer; color: var(--accent);
+  }
+  .date-time-row { display:flex; gap:10px; margin-top:4px; }
+  .date-time-row > div { flex:1; }
+  .date-time-row input { margin-top:6px; }
+  .btn-primary {
+    font-family:'IBM Plex Sans', system-ui, sans-serif; font-weight:600; font-size:14px;
+    color:#fff; background: var(--accent); border:none; border-radius:12px;
+    padding:13px 16px; width:100%; cursor:pointer; margin-top:8px;
+  }
+  .btn-primary:hover { background: var(--accent-dark); }
+  .btn-primary:disabled { opacity:0.6; cursor:default; }
+
+  /* Sort control */
+  .sort-row { padding: 0 20px 12px; display:flex; align-items:center; gap:8px; }
+  .sort-row .label { font-size:12px; color:var(--faint); margin-right:2px; }
+  .sort-btn {
+    font-family:'IBM Plex Sans', system-ui, sans-serif; font-size:12.5px; font-weight:600;
+    border-radius:999px; padding:7px 12px; cursor:pointer; border:1px solid var(--input-border);
+    background:#fff; color:var(--muted);
+  }
+  .sort-btn.active { background: var(--accent); border-color: var(--accent); color:#fff; }
+
+  /* Results */
+  .results { padding: 0 20px 8px; display:flex; flex-direction:column; gap:12px; }
+  .msg-panel {
+    background: var(--card); border:1px solid var(--border); border-radius:14px;
+    padding:16px 18px; color: var(--muted); font-size:13.5px;
+  }
+  .msg-panel.error { border-color: rgba(208,59,59,0.3); background: var(--error-tint); color: var(--error); }
+
+  .card {
+    border-radius:16px; border:1px solid var(--border); background: var(--card);
+    padding:16px; display:flex; flex-direction:column; gap:2px;
+    box-shadow:0 1px 2px rgba(11,11,11,0.04);
+  }
+  .card.best { border:1.5px solid var(--accent); background: var(--accent-tint); box-shadow:0 1px 3px rgba(52,84,209,0.12); }
+
+  .best-badge {
+    display:inline-flex; align-items:center; gap:5px; align-self:flex-start;
+    background: var(--accent); color:#fff; font-size:11.5px; font-weight:600;
+    padding:5px 10px 5px 8px; border-radius:999px; margin-bottom:6px;
+  }
+
+  .card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:8px 10px; flex-wrap:wrap; }
+  .card-header-left { display:flex; align-items:center; gap:7px; min-width:0; flex:1 1 140px; flex-wrap:wrap; }
+  .op-tag { font-size:11px; font-weight:600; color:var(--muted); background:#eef0f4; border-radius:6px; padding:3px 7px; }
+  .num-tag { font-size:13px; font-weight:600; color:var(--muted); }
+  .badge { display:flex; align-items:center; gap:5px; border-radius:999px; padding:5px 10px; flex-shrink:0; white-space:nowrap; }
+  .badge .pct { font-size:13px; font-weight:600; color:var(--ink); }
+
+  .times-row { display:flex; align-items:center; gap:12px; margin-top:12px; }
+  .time-num { font-family:'Space Grotesk', system-ui, sans-serif; font-weight:700; font-size:26px; }
+  .time-track { flex:1; display:flex; align-items:center; min-width:24px; }
+  .time-dot { width:6px; height:6px; border-radius:50%; background:#c3c2b7; flex-shrink:0; }
+  .time-line { flex:1; height:1px; background:#c3c2b7; }
+  .meta-row { font-size:12.5px; color:var(--muted); margin-top:4px; }
+
+  .divider { height:1px; background: var(--divider); margin:12px 0; }
+
+  .info-row { display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+  .info-item { display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--muted); }
+  .info-item svg { color: var(--faint); flex-shrink:0; }
+
+  .confidence-note { font-size:11px; color: var(--faint); margin-top:8px; line-height:1.4; }
+
+  .change-toggle {
+    display:flex; align-items:center; justify-content:space-between; margin-top:14px;
+    padding-top:12px; border-top:1px dashed var(--divider); cursor:pointer;
+  }
+  .change-tag { font-size:11.5px; font-weight:600; color:var(--muted); background:#eef0f4; border-radius:999px; padding:4px 10px; }
+
+  .legs { margin-top:14px; display:flex; flex-direction:column; }
+  .leg-row { display:flex; gap:10px; }
+  .leg-rail { width:8px; display:flex; flex-direction:column; align-items:center; padding-top:4px; }
+  .leg-dot { width:8px; height:8px; border-radius:50%; background: var(--accent); flex-shrink:0; }
+  .leg-connector { flex:1; width:2px; background:#c3c2b7; margin:4px 0; }
+  .leg-body { flex:1; padding-bottom:12px; }
+  .leg-body-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .leg-op { font-size:12.5px; font-weight:600; color:var(--muted); }
+  .leg-pct-badge { display:flex; align-items:center; gap:4px; border-radius:999px; padding:3px 8px; flex-shrink:0; }
+  .leg-pct-badge span { font-size:11.5px; font-weight:600; color:var(--ink); }
+  .leg-times { font-family:'Space Grotesk', system-ui, sans-serif; font-weight:600; font-size:15px; margin-top:3px; }
+  .leg-sub { font-size:11.5px; color: var(--faint); margin-top:2px; }
+
+  .transfer-node { display:flex; gap:10px; }
+  .transfer-rail { width:8px; display:flex; flex-direction:column; align-items:center; }
+  .transfer-connector { width:2px; flex:1; background:#c3c2b7; margin-bottom:2px; }
+  .transfer-body {
+    flex:1; display:flex; align-items:center; gap:8px; background: var(--bg);
+    border-radius:10px; padding:8px 10px; margin-bottom:4px;
+  }
+  .transfer-body svg { flex-shrink:0; }
+  .transfer-body span { font-size:11.5px; color:var(--muted); }
+
+  .end-to-end { margin-top:6px; border-radius:12px; padding:12px 14px; }
+  .end-to-end.known { background: var(--good-tint); }
+  .end-to-end.unknown { background: var(--unknown-tint); }
+  .end-to-end-head { display:flex; align-items:center; justify-content:space-between; }
+  .end-to-end-head .label { font-size:12px; font-weight:600; color:var(--muted); }
+  .end-to-end-head .val { font-family:'Space Grotesk', system-ui, sans-serif; font-weight:700; font-size:18px; }
+  .meter { height:6px; border-radius:999px; background:rgba(11,11,11,0.08); margin-top:8px; overflow:hidden; }
+  .meter-fill { height:100%; border-radius:999px; }
+  .end-to-end-note { font-size:11px; color: var(--faint); margin-top:7px; line-height:1.4; }
+
+  .footer-note { padding: 12px 20px 4px; font-size:11px; color: var(--faint); line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand">
+    <div class="brand-left">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" style="color:#3454d1;">
+        <rect x="4" y="3" width="16" height="13" rx="4" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M4 11h16" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M9 20l-2 2M15 20l2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        <circle cx="8.5" cy="13.3" r="0.9" fill="currentColor"/>
+        <circle cx="15.5" cy="13.3" r="0.9" fill="currentColor"/>
+      </svg>
+      <span>TrainAware</span>
+    </div>
+    <a class="nav-link" href="/">Train lookup →</a>
+  </div>
+
+  <div class="search-section">
+    <div class="search-summary" id="searchSummary">
+      <div class="search-summary-left">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" style="color:#5b5d66; flex-shrink:0;">
+          <path d="M11 4L4 11l7 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 11h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <div style="min-width:0;">
+          <div class="search-summary-route" id="summaryRoute"></div>
+          <div class="search-summary-sub" id="summarySub"></div>
+        </div>
+      </div>
+      <svg id="summaryChevron" class="chevron" width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <path d="M6 9l6 6 6-6" stroke="#5b5d66" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+
+    <div class="search-form" id="searchForm" style="display:none;">
+      <label>From</label>
+      <input id="fromInput" type="text">
+
+      <div class="swap-row">
+        <button class="swap-btn" id="swapBtn" type="button" title="Swap origin/destination">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+            <path d="M7 3v17M7 3L4 6M7 3l3 3M17 21V4M17 21l-3-3M17 21l3-3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <label>To</label>
+      <input id="toInput" type="text">
+
+      <div class="date-time-row">
+        <div>
+          <label>Date</label>
+          <input id="dateInput" type="date">
+        </div>
+        <div>
+          <label>Time</label>
+          <input id="timeInput" type="time">
+        </div>
+      </div>
+
+      <button class="btn-primary" id="searchBtn" type="button">Search</button>
+    </div>
+  </div>
+
+  <div class="sort-row" id="sortRow" style="display:none;">
+    <span class="label">Sort</span>
+    <button class="sort-btn" id="sortReliabilityBtn">Best reliability</button>
+    <button class="sort-btn" id="sortFastestBtn">Fastest</button>
+  </div>
+
+  <div class="results" id="results"></div>
+  <div class="footer-note" id="footerNote"></div>
+</div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+// API datetimes look like "20260826T182600" (Navitia format, no separators).
+function fmtTime(iso) {
+  if (!iso || iso.length < 13) return '--:--';
+  return `${iso.slice(9, 11)}:${iso.slice(11, 13)}`;
+}
+
+function fmtDuration(seconds) {
+  if (seconds === null || seconds === undefined) return '--';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}` : `${m}min`;
+}
+
+function tomorrowISODate() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+function tierFor(pct) {
+  if (pct === null || pct === undefined) return 'unknown';
+  if (pct >= 75) return 'good';
+  if (pct >= 55) return 'warning';
+  if (pct >= 35) return 'serious';
+  return 'critical';
+}
+
+const TIER_COLOR = { good: '#0ca30c', warning: '#c98500', serious: '#ec835a', critical: '#d03b3b', unknown: '#5b5d66' };
+const TIER_TINT  = { good: 'var(--good-tint)', warning: 'var(--warning-tint)', serious: 'var(--serious-tint)', critical: 'var(--critical-tint)', unknown: 'var(--unknown-tint)' };
+
+function tierIconSvg(tier, color) {
+  if (tier === 'good') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="color:${color};"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  }
+  if (tier === 'unknown') {
+    return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="color:${color};"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7"/><path d="M12 16v.01M12 8a2.5 2.5 0 012.5 2.5c0 1.5-2.5 1.8-2.5 3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>`;
+  }
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" style="color:${color};"><path d="M12 4L3 20h18L12 4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 10.5v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="16.6" r="0.9" fill="currentColor"/></svg>`;
+}
+
+// One leg's on-time percentage, or null if this leg has no reliability history yet
+// (always true for RER/Transilien mission-code legs -- see sncf_journeys.py).
+function legPct(leg) {
+  const r = leg.reliability;
+  if (!r || !r.available) return null;
+  return r.overall ? r.overall.on_time_pct : null;
+}
+
+// The single number used for the card's headline badge and for "best reliability"
+// sorting. For a direct train this is that train's own on-time %. For a connecting
+// itinerary it's the true end-to-end completion probability (combined_success_probability)
+// -- NOT the same scale as on-time %, but the best single "how likely am I to actually
+// get there" figure we have; null (shown as "Unknown") when SNCF/TchouTchou don't have
+// enough data to estimate it, most commonly because a leg runs through an RER/Transilien
+// mission-code train (see main.py's _combined_probability() docstring).
+function headline(journey) {
+  if (journey.legs.length <= 1) {
+    return { pct: legPct(journey.legs[0]), label: 'on time' };
+  }
+  return { pct: journey.combined_success_probability, label: 'to complete' };
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const state = {
+  from: 'Paris Gare de Lyon',
+  to: 'Lyon Part-Dieu',
+  date: tomorrowISODate(),
+  time: '18:00',
+  searchExpanded: false,
+  sortBy: 'reliability',
+  status: 'idle',        // idle | loading | error | ok
+  errorMessage: '',
+  results: [],
+  methodologyNote: '',
+  expandedCards: new Set(),
+};
+
+// ---------------------------------------------------------------------------
+// Networking
+// ---------------------------------------------------------------------------
+
+async function runSearch() {
+  if (!state.from.trim() || !state.to.trim() || !state.date) {
+    state.status = 'error';
+    state.errorMessage = 'Please fill in From, To, and a date before searching.';
+    renderResults();
+    return;
+  }
+  state.status = 'loading';
+  state.expandedCards = new Set();
+  renderResults();
+
+  const qs = new URLSearchParams({
+    from: state.from.trim(),
+    to: state.to.trim(),
+    date: state.date,
+    time: state.time || '08:00',
+    count: '6',
+  });
+
+  try {
+    const res = await fetch(`/api/search?${qs.toString()}`);
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      state.status = 'error';
+      state.errorMessage = `The API returned something that wasn't valid JSON (HTTP ${res.status}). Check the terminal running main.py for a traceback.`;
+      renderResults();
+      return;
+    }
+    if (!res.ok) {
+      state.status = 'error';
+      state.errorMessage = data.detail || `Request failed (HTTP ${res.status}).`;
+      renderResults();
+      return;
+    }
+    state.results = data.results || [];
+    state.methodologyNote = data.combined_probability_methodology_note || '';
+    state.status = 'ok';
+    renderResults();
+  } catch (err) {
+    state.status = 'error';
+    state.errorMessage = `Could not reach the API at all -- is "python main.py" still running? (${err})`;
+    renderResults();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: search bar
+// ---------------------------------------------------------------------------
+
+function renderSummary() {
+  document.getElementById('summaryRoute').textContent = `${state.from || '?'} → ${state.to || '?'}`;
+  document.getElementById('summarySub').textContent = `${state.date || '?'} · ${state.time || '?'}`;
+  document.getElementById('summaryChevron').classList.toggle('open', state.searchExpanded);
+  document.getElementById('searchForm').style.display = state.searchExpanded ? 'flex' : 'none';
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: one leg row (inside an expanded connecting itinerary)
+// ---------------------------------------------------------------------------
+
+function renderLeg(leg) {
+  const pct = legPct(leg);
+  const tier = tierFor(pct);
+  const color = TIER_COLOR[tier];
+  const tint = TIER_TINT[tier];
+  const label = leg.train_number || leg.headsign || '?';
+  const delayText = leg.reliability && leg.reliability.available && leg.reliability.overall.mean_delay_minutes !== null
+    ? `usually +${leg.reliability.overall.mean_delay_minutes} min`
+    : 'no delay history yet';
+  const pctText = pct !== null && pct !== undefined ? `${pct}%` : 'No data';
+
+  return `
+    <div class="leg-body-head">
+      <span class="leg-op">${escapeHtml(leg.operator || '')} ${escapeHtml(label)}</span>
+      <div class="leg-pct-badge" style="background:${tint};"><span>${pctText}</span></div>
+    </div>
+    <div class="leg-times">${fmtTime(leg.departure_datetime)} → ${fmtTime(leg.arrival_datetime)}</div>
+    <div class="leg-sub">${escapeHtml(leg.from_station || '')} → ${escapeHtml(leg.to_station || '')} · ${escapeHtml(delayText)}</div>
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: one result card
+// ---------------------------------------------------------------------------
+
+function renderCard(journey, idx, isBest) {
+  const h = headline(journey);
+  const tier = tierFor(h.pct);
+  const color = TIER_COLOR[tier];
+  const tint = TIER_TINT[tier];
+  const isConnecting = journey.legs.length > 1;
+  const expanded = state.expandedCards.has(idx);
+  const pctText = h.pct !== null && h.pct !== undefined ? `${h.pct}%` : 'Unknown';
+
+  const firstLegOperators = journey.legs.map((l) => l.operator).filter(Boolean).join(' + ');
+  const firstLegNumbers = journey.legs.map((l) => l.train_number || l.headsign || '?').join(' / ');
+
+  let confidenceLine = '';
+  const singleLegRel = journey.legs.length === 1 ? journey.legs[0].reliability : null;
+  if (singleLegRel && singleLegRel.confidence_note) {
+    confidenceLine = `<div class="confidence-note">${escapeHtml(singleLegRel.confidence_note)}</div>`;
+  } else if (isConnecting && journey.combined_probability_notes && journey.combined_probability_notes.length) {
+    confidenceLine = `<div class="confidence-note">${escapeHtml(journey.combined_probability_notes.join(' '))}</div>`;
+  }
+
+  let legsHtml = '';
+  if (isConnecting && expanded) {
+    const rows = [];
+    journey.legs.forEach((leg, i) => {
+      const isLast = i === journey.legs.length - 1;
+      rows.push(`
+        <div class="leg-row">
+          <div class="leg-rail">
+            <div class="leg-dot"></div>
+            ${isLast ? '' : '<div class="leg-connector"></div>'}
+          </div>
+          <div class="leg-body">${renderLeg(leg)}</div>
+        </div>
+      `);
+      if (!isLast) {
+        const transfer = journey.transfers[i];
+        const buffer = transfer && transfer.buffer_minutes !== null && transfer.buffer_minutes !== undefined
+          ? `${transfer.buffer_minutes} min to change`
+          : 'transfer time unknown';
+        const riskText = transfer && transfer.connection_success_probability !== null && transfer.connection_success_probability !== undefined
+          ? `${transfer.connection_success_probability}% chance you make it`
+          : (transfer && transfer.note) || 'connection risk unknown';
+        rows.push(`
+          <div class="transfer-node">
+            <div class="transfer-rail"><div class="transfer-connector"></div></div>
+            <div class="transfer-body">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" style="color:#3454d1;"><path d="M7 7h13M17 3l3 4-3 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 17H4M7 21l-3-4 3-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>${escapeHtml(buffer)} at ${escapeHtml(transfer ? transfer.at_station : '?')} · ${escapeHtml(riskText)}</span>
+            </div>
+          </div>
+        `);
+      }
+    });
+
+    const combinedKnown = journey.combined_success_probability !== null && journey.combined_success_probability !== undefined;
+    const endToEndTier = tierFor(journey.combined_success_probability);
+    const endToEndColor = TIER_COLOR[endToEndTier];
+
+    rows.push(`
+      <div class="end-to-end ${combinedKnown ? 'known' : 'unknown'}">
+        <div class="end-to-end-head">
+          <span class="label">End-to-end: you make it all the way</span>
+          <span class="val" style="color:${combinedKnown ? endToEndColor : 'var(--unknown)'};">${combinedKnown ? journey.combined_success_probability + '%' : 'Unknown'}</span>
+        </div>
+        ${combinedKnown ? `
+          <div class="meter"><div class="meter-fill" style="width:${journey.combined_success_probability}%; background:${endToEndColor};"></div></div>
+          <div class="end-to-end-note">Accounts for the risk of missing the connection and the final train being cancelled -- a first-pass estimate, not exact.</div>
+        ` : `
+          <div class="end-to-end-note">${escapeHtml((journey.combined_probability_notes || []).join(' ') || 'Not enough reliability history yet to estimate this connection.')}</div>
+        `}
+      </div>
+    `);
+
+    legsHtml = `<div class="legs">${rows.join('')}</div>`;
+  }
+
+  const chevronOpen = expanded ? 'open' : '';
+
+  return `
+    <div class="card ${isBest ? 'best' : ''}">
+      ${isBest ? `
+        <div class="best-badge">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" stroke="#ffffff" stroke-width="1.9" stroke-linejoin="round"/>
+            <path d="M9 12l2 2 4-4" stroke="#ffffff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Best reliability
+        </div>
+      ` : ''}
+
+      <div class="card-header">
+        <div class="card-header-left">
+          <span class="op-tag">${escapeHtml(firstLegOperators || '?')}</span>
+          <span class="num-tag">${escapeHtml(firstLegNumbers)}</span>
+        </div>
+        <div class="badge" style="background:${tint};">
+          ${tierIconSvg(tier, color)}
+          <span class="pct">${pctText}${(h.pct !== null && h.pct !== undefined) ? ' ' + escapeHtml(h.label) : ''}</span>
+        </div>
+      </div>
+
+      <div class="times-row">
+        <span class="time-num">${fmtTime(journey.departure_datetime)}</span>
+        <div class="time-track">
+          <div class="time-dot"></div><div class="time-line"></div><div class="time-dot"></div>
+        </div>
+        <span class="time-num">${fmtTime(journey.arrival_datetime)}</span>
+      </div>
+      <div class="meta-row">${fmtDuration(journey.duration_seconds)} · ${isConnecting ? `${journey.legs.length - 1} change${journey.legs.length - 1 > 1 ? 's' : ''}` : 'Direct'}</div>
+      ${confidenceLine}
+
+      ${!isConnecting ? `
+        <div class="divider"></div>
+        <div class="info-row">
+          <div class="info-item">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.6"/><path d="M12 7.5V12l3 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>${singleLegRel && singleLegRel.available && singleLegRel.overall.mean_delay_minutes !== null ? `Usually +${singleLegRel.overall.mean_delay_minutes} min` : 'No delay history yet'}</span>
+          </div>
+        </div>
+      ` : `
+        <div class="change-toggle" data-toggle-idx="${idx}">
+          <span class="change-tag">${journey.legs.length - 1} change${journey.legs.length - 1 > 1 ? 's' : ''} · ${escapeHtml(journey.transfers[0] ? journey.transfers[0].at_station : '')}</span>
+          <svg class="chevron ${chevronOpen}" width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="#5b5d66" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        ${legsHtml}
+      `}
+    </div>
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: results list
+// ---------------------------------------------------------------------------
+
+function sortedResults() {
+  const arr = state.results.map((j, i) => ({ journey: j, idx: i }));
+  if (state.sortBy === 'fastest') {
+    arr.sort((a, b) => (a.journey.duration_seconds ?? Infinity) - (b.journey.duration_seconds ?? Infinity));
+  } else {
+    arr.sort((a, b) => {
+      const pa = headline(a.journey).pct;
+      const pb = headline(b.journey).pct;
+      if (pa === null || pa === undefined) return 1;
+      if (pb === null || pb === undefined) return -1;
+      return pb - pa;
+    });
+  }
+  return arr;
+}
+
+function renderResults() {
+  const resultsEl = document.getElementById('results');
+  const sortRowEl = document.getElementById('sortRow');
+  const footerEl = document.getElementById('footerNote');
+
+  document.getElementById('sortReliabilityBtn').classList.toggle('active', state.sortBy === 'reliability');
+  document.getElementById('sortFastestBtn').classList.toggle('active', state.sortBy === 'fastest');
+
+  if (state.status === 'idle') {
+    resultsEl.innerHTML = `<div class="msg-panel">Set your route above and hit Search.</div>`;
+    sortRowEl.style.display = 'none';
+    footerEl.textContent = '';
+    return;
+  }
+  if (state.status === 'loading') {
+    resultsEl.innerHTML = `<div class="msg-panel">Searching…</div>`;
+    sortRowEl.style.display = 'none';
+    footerEl.textContent = '';
+    return;
+  }
+  if (state.status === 'error') {
+    resultsEl.innerHTML = `<div class="msg-panel error">${escapeHtml(state.errorMessage)}</div>`;
+    sortRowEl.style.display = 'none';
+    footerEl.textContent = '';
+    return;
+  }
+  if (!state.results.length) {
+    resultsEl.innerHTML = `<div class="msg-panel">No trains found for this search. Try a different time or check the station names.</div>`;
+    sortRowEl.style.display = 'none';
+    footerEl.textContent = '';
+    return;
+  }
+
+  sortRowEl.style.display = 'flex';
+  const ranked = sortedResults();
+  const pcts = ranked.map((r) => headline(r.journey).pct).filter((p) => p !== null && p !== undefined);
+  const bestPct = pcts.length ? Math.max(...pcts) : null;
+
+  resultsEl.innerHTML = ranked.map(({ journey, idx }) => {
+    const pct = headline(journey).pct;
+    const isBest = bestPct !== null && pct === bestPct;
+    return renderCard(journey, idx, isBest);
+  }).join('');
+
+  resultsEl.querySelectorAll('[data-toggle-idx]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const i = Number(el.getAttribute('data-toggle-idx'));
+      if (state.expandedCards.has(i)) state.expandedCards.delete(i);
+      else state.expandedCards.add(i);
+      renderResults();
+    });
+  });
+
+  footerEl.textContent = state.methodologyNote || '';
+}
+
+// ---------------------------------------------------------------------------
+// Wire up controls
+// ---------------------------------------------------------------------------
+
+document.getElementById('fromInput').value = state.from;
+document.getElementById('toInput').value = state.to;
+document.getElementById('dateInput').value = state.date;
+document.getElementById('timeInput').value = state.time;
+
+document.getElementById('searchSummary').addEventListener('click', () => {
+  state.searchExpanded = !state.searchExpanded;
+  renderSummary();
+});
+
+document.getElementById('swapBtn').addEventListener('click', () => {
+  const f = document.getElementById('fromInput');
+  const t = document.getElementById('toInput');
+  const tmp = f.value;
+  f.value = t.value;
+  t.value = tmp;
+});
+
+document.getElementById('searchBtn').addEventListener('click', () => {
+  state.from = document.getElementById('fromInput').value;
+  state.to = document.getElementById('toInput').value;
+  state.date = document.getElementById('dateInput').value;
+  state.time = document.getElementById('timeInput').value;
+  state.searchExpanded = false;
+  renderSummary();
+  runSearch();
+});
+
+document.getElementById('sortReliabilityBtn').addEventListener('click', () => {
+  state.sortBy = 'reliability';
+  renderResults();
+});
+document.getElementById('sortFastestBtn').addEventListener('click', () => {
+  state.sortBy = 'fastest';
+  renderResults();
+});
+
+// Initial paint + first search, so the page isn't empty on load.
+renderSummary();
+renderResults();
+runSearch();
+</script>
+</body>
+</html>

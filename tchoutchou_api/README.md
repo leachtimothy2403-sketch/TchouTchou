@@ -17,8 +17,9 @@ set TCHOUTCHOU_DB=..\tchoutchou_ingest\tchoutchou.db      # PowerShell: $env:TCH
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000/` for the UI, or hit the JSON endpoints directly, e.g.
-`http://localhost:8000/api/trains/9575/status`.
+Open `http://localhost:8000/` for the single-train lookup UI, `http://localhost:8000/static/search.html`
+for the real journey-search UI (see "SNCF journey search setup" below -- needs `SNCF_API_KEY`),
+or hit the JSON endpoints directly, e.g. `http://localhost:8000/api/trains/9575/status`.
 
 **Run this next to wherever the live `tchoutchou.db` actually is** -- today that's the
 VPS (`C:\TchouTchou\tchoutchou_ingest\tchoutchou.db`), not your local dev machine, since
@@ -46,8 +47,8 @@ here -- this MVP is just the app itself).
   (added 2026-08-24), backed by SNCF's own journey-planning API and annotated with
   TchouTchou's reliability data per leg, plus a connection-risk-adjusted end-to-end
   probability for itineraries with a change. **Needs `SNCF_API_KEY` set** -- see "SNCF
-  journey search setup" below. Backs the search-results screen that previously only had
-  mockup sample data.
+  journey search setup" below. Backs `static/search.html` (added 2026-08-24), the real
+  journey-search UI -- see that section below.
 
 ## SNCF journey search setup
 
@@ -82,6 +83,39 @@ a single-instance MVP.
 **Commercial-use terms of the SNCF API are not yet confirmed** (see
 `tchoutchou_monetization_mvp.md`) -- fine to build and test against, worth confirming with
 SNCF (digital@sncf.fr) before this is public-facing.
+
+## Journey-search UI (`static/search.html`)
+
+Added 2026-08-24: a real, working page for `/api/search` -- from/to/date/time inputs,
+results sorted by reliability or speed, connecting itineraries expandable to show each
+leg and the transfer, and the end-to-end completion probability with its meter. Visually
+based on the TrainAware search-results mockup (a Claude Design canvas prototype built
+earlier in the same design session -- link in `tchoutchou_monetization_mvp.md`), but that
+mockup itself can't be wired to this API directly: it's published as a hosted page on
+claude.ai, which runs in a sandboxed iframe with no outbound network access, and
+`localhost` isn't reachable from a remote page anyway. So this is a fresh, from-scratch
+implementation living in this codebase instead, served by this app and calling `/api/search`
+same-origin (no CORS setup needed).
+
+A few real-data details worth knowing:
+- For a **direct** train, the card's headline badge is that train's own on-time %.
+- For a **connecting** itinerary, the headline badge is `combined_success_probability`
+  instead (a different, stricter number -- the odds of completing the whole journey, not
+  just one train's punctuality) -- shown as "Unknown" with no fake percentage when it's
+  `null` (see the 2026-08-24 bug fix in `main.py`, and the RER/mission-code gap above).
+- Platform info isn't shown here -- `/api/search` doesn't return it (that's `/api/trains/{n}/status`,
+  a separate lookup); no point fabricating it.
+- No build step, no dependencies beyond a Google Fonts `@import` (falls back to system
+  fonts if that's unreachable) -- open the file directly or via the FastAPI static mount.
+
+**Verified rendering (2026-08-24) against the real SNCF response captured while building
+`/api/search`** (Paris Gare de Lyon → Lyon Part-Dieu, including the RER-into-Chessy
+itinerary with the unknown-connection-risk case) using headless Chromium -- all 5 result
+cards render correctly, the "Unknown" end-to-end case shows properly (not a false 100%),
+and a mocked 502 (missing `SNCF_API_KEY`) renders as a clean error panel. **Not yet
+tested with a human clicking through it in a real browser against a live server** -- the
+form controls (search toggle, swap, sort, expand/collapse) work in isolation but haven't
+been through an actual end-to-end click-through session yet.
 
 ## Known gaps (read before demoing this to anyone)
 
@@ -144,6 +178,7 @@ SNCF (digital@sncf.fr) before this is public-facing.
 | `main.py` | FastAPI app, all endpoints. |
 | `db.py` | Read-only connection helper + small utilities duplicated (not imported) from `tchoutchou_ingest/` -- UIC extraction, train nomenclature fallback, mission-code detection. Kept as a separate copy since this is a different deployable that only reads the collector's db. |
 | `sncf_journeys.py` | Client for SNCF's journey-planning API (added 2026-08-24) -- station-name resolution, journey search, response parsing. See "SNCF journey search setup" above. |
-| `static/index.html` | Self-contained single-page UI (no build step, no external dependencies) -- train number search box that calls the combined endpoint and renders the result. |
+| `static/index.html` | Self-contained single-page UI (no build step, no external dependencies) -- train number search box that calls the combined endpoint and renders the result. Links to `search.html`. |
+| `static/search.html` | Journey-search UI (added 2026-08-24) -- calls `/api/search`, renders sortable/expandable results. See "Journey-search UI" above. |
 | `requirements.txt` | `fastapi`, `uvicorn[standard]`, `requests`. |
 | `test_search_local.py` | No-network sanity check for `/api/search`'s parsing and connection-risk math, run against a hand-built SNCF-shaped response -- `python test_search_local.py`. Doesn't need `SNCF_API_KEY`; doesn't replace testing against a real response once you have a key. |
