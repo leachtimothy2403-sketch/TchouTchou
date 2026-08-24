@@ -69,6 +69,49 @@ def day_type_for(start_date: str) -> str:
     return "weekday"
 
 
+def to_epoch(fetched_at_utc):
+    """fetched_at_utc is always an ISO8601 string with an explicit +00:00 offset (see
+    snapshots.fetched_at_utc) -- fromisoformat handles that directly, no dateutil needed."""
+    return datetime.fromisoformat(fetched_at_utc).timestamp()
+
+
+def checkpoint_delay(history, target_epoch):
+    """history: [(fetched_epoch, arrival_delay), ...] ascending by fetched_epoch (one
+    entry per poll that reported this stop, already collapsed for same-snapshot
+    duplicates). Returns the most recently known arrival_delay as of target_epoch -- i.e.
+    the last poll at or before that moment -- or None if polling hadn't started yet by
+    then."""
+    result = None
+    for fetched_epoch, delay in history:
+        if fetched_epoch <= target_epoch:
+            result = delay
+        else:
+            break
+    return result
+
+
+def compute_trip_final_checkpoints(arrival_time, arrival_delay, departure_time, departure_delay, epoch_history):
+    """Anchors the T-30/T-15/T-5 checkpoints on the stop's SCHEDULED time (final
+    observed time minus final observed delay), preferring the arrival pair and falling
+    back to departure when arrival was never observed (e.g. the trip's own origin stop
+    has no arrival). Returns (scheduled_arrival_epoch, scheduled_departure_epoch,
+    delay_at_t30, delay_at_t15, delay_at_t5)."""
+    scheduled_arrival_epoch = (
+        arrival_time - arrival_delay if arrival_time is not None and arrival_delay is not None else None
+    )
+    scheduled_departure_epoch = (
+        departure_time - departure_delay if departure_time is not None and departure_delay is not None else None
+    )
+    anchor_epoch = scheduled_arrival_epoch if scheduled_arrival_epoch is not None else scheduled_departure_epoch
+
+    delay_t30 = delay_t15 = delay_t5 = None
+    if anchor_epoch is not None and epoch_history:
+        delay_t30 = checkpoint_delay(epoch_history, anchor_epoch - 30 * 60)
+        delay_t15 = checkpoint_delay(epoch_history, anchor_epoch - 15 * 60)
+        delay_t5 = checkpoint_delay(epoch_history, anchor_epoch - 5 * 60)
+    return scheduled_arrival_epoch, scheduled_departure_epoch, delay_t30, delay_t15, delay_t5
+
+
 def bucket_counts(delay_seconds):
     """Returns (on_time, late_5, late_15, late_30) increments for one observation."""
     if delay_seconds is None:
@@ -235,6 +278,15 @@ def process_trip(cur, trip_id, start_date):
             departure_time if departure_time is not None else cv[3],
         )
 
+    # Per-stop arrival_delay history (one point per poll, already same-snapshot-collapsed
+    # above), feeding trip_finals' T-30/T-15/T-5 predictive-accuracy checkpoints below --
+    # built from the same snapshot_order/per_snapshot structures already in memory, no
+    # extra raw query needed.
+    per_stop_epoch_history = {}
+    for fetched_at, snap_id, stop_id in snapshot_order:
+        arrival_delay = per_snapshot[(snap_id, stop_id)][0]
+        per_stop_epoch_history.setdefault(stop_id, []).append((to_epoch(fetched_at), arrival_delay))
+
     if not final_by_stop:
         cur.execute(
             "INSERT INTO aggregation_state (trip_id, start_date, train_number, cancelled, aggregated_at_utc) "
@@ -246,8 +298,28 @@ def process_trip(cur, trip_id, start_date):
     direction_id_val = direction_id if direction_id is not None else -1
     train_type_bucket = train_type or "unknown"
 
-    for stop_id, (arrival_delay, _arrival_time, departure_delay, _departure_time) in final_by_stop.items():
+    for stop_id, (arrival_delay, arrival_time, departure_delay, departure_time) in final_by_stop.items():
         station_uic = extract_uic(stop_id)
+
+        sched_arr_epoch, sched_dep_epoch, delay_t30, delay_t15, delay_t5 = compute_trip_final_checkpoints(
+            arrival_time, arrival_delay, departure_time, departure_delay,
+            per_stop_epoch_history.get(stop_id, []),
+        )
+        cur.execute(
+            "INSERT INTO trip_finals (trip_id, start_date, stop_id, station_uic, train_number, "
+            "direction_id, day_type, train_type, scheduled_arrival_epoch, final_arrival_delay, "
+            "final_arrival_time, scheduled_departure_epoch, final_departure_delay, final_departure_time, "
+            "delay_at_t30, delay_at_t15, delay_at_t5, created_at_utc) "
+            "VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?,?, ?) "
+            "ON CONFLICT(trip_id, start_date, stop_id) DO NOTHING",
+            (
+                trip_id, start_date, stop_id, station_uic, train_number,
+                direction_id, day_type, train_type_bucket, sched_arr_epoch, arrival_delay,
+                arrival_time, sched_dep_epoch, departure_delay, departure_time,
+                delay_t30, delay_t15, delay_t5, now,
+            ),
+        )
+
         if station_uic is None:
             continue
         on_time, late5, late15, late30 = bucket_counts(arrival_delay)

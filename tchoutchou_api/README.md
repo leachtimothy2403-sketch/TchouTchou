@@ -42,6 +42,55 @@ here -- this MVP is just the app itself).
 - `GET /api/trains/{train_number}/deep_link?date=YYYYMMDD` -- best-effort SNCF Connect
   URL, `confirmed: false` until manually validated (see "Known gaps").
 - `GET /api/trains/{train_number}` -- all four bundled together (what the UI calls).
+- `GET /api/search?from=...&to=...&date=YYYY-MM-DD&time=HH:MM` -- real itinerary search
+  (added 2026-08-24), backed by SNCF's own journey-planning API and annotated with
+  TchouTchou's reliability data per leg, plus a connection-risk-adjusted end-to-end
+  probability for itineraries with a change. **Needs `SNCF_API_KEY` set** -- see "SNCF
+  journey search setup" below. Backs the search-results screen that previously only had
+  mockup sample data.
+
+## SNCF journey search setup
+
+`/api/search` calls SNCF's public journey-planning API (Navitia-based) to generate the
+actual list of trains between two stations -- TchouTchou's own pipeline tracks trains
+that are already running, it doesn't do journey planning, so this piece has to come from
+SNCF rather than being built here (see the monetization/MVP discussion,
+`tchoutchou_monetization_mvp.md`, for why).
+
+1. Sign up for a free key at
+   https://numerique.sncf.com/startup/api/token-developpeur/ -- free tier is 5,000
+   requests/day, and data covers roughly yesterday through 23 days ahead.
+2. Set it as an environment variable before starting the API:
+   `set SNCF_API_KEY=your-key-here` (PowerShell: `$env:SNCF_API_KEY = "your-key-here"`).
+3. Try it: `http://localhost:8000/api/search?from=Paris+Gare+de+Lyon&to=Lyon+Part-Dieu&date=2026-08-26&time=18:00`
+
+**This has not been tested against a real key yet** -- `sncf_journeys.py` was written
+from SNCF's/Navitia's public documentation, not from a live call (no key was available
+while building it). Two specific things need checking against a real response, both
+flagged with `IMPORTANT` comments in `sncf_journeys.py`:
+- the coverage id `"sncf"` -- documented convention, not confirmed against `GET
+  /v1/coverage`;
+- where the commercial train number (e.g. "6683") actually lives in the response --
+  `_extract_train_number()` guesses `headsign` first, then `code`.
+
+**Once you have a key, the fastest way to find and fix any mismatch**: run one real
+`/api/search` request, and if `train_number` comes back null, or looks like a station
+name instead of a number, or reliability data isn't matching up, paste me the raw SNCF
+response for one journey (or the error) and I'll correct the field mapping precisely
+instead of guessing further. A first-pass local check (parsing + connection-risk math
+against a hand-built response, no key needed) already passed -- see `test_search_local.py`
+-- so the remaining risk is specifically in how SNCF's real coverage names things, not in
+the overall logic.
+
+**Journey-search API results are cached in-memory for 5 minutes**, bucketed to the
+nearest 15-minute departure window, to protect the 5,000/day free tier under repeat
+searches for the same popular route/time -- see `sncf_journeys.py`'s
+`JOURNEY_CACHE_TTL_SECONDS`. This is per-process and doesn't survive a restart; fine for
+a single-instance MVP.
+
+**Commercial-use terms of the SNCF API are not yet confirmed** (see
+`tchoutchou_monetization_mvp.md`) -- fine to build and test against, worth confirming with
+SNCF (digital@sncf.fr) before this is public-facing.
 
 ## Known gaps (read before demoing this to anyone)
 
@@ -78,6 +127,17 @@ here -- this MVP is just the app itself).
   VPS.
 - **No auth, no rate limiting, no HTTPS.** Fine for local/internal use; needs work before
   this is public-facing.
+- **`/api/search` untested against a real SNCF API response** -- see "SNCF journey search
+  setup" above for exactly what's inferred vs. confirmed.
+- **The end-to-end connection probability is a first-pass estimate**, not the full
+  historical buffer-time model from the product design discussion -- it's based on one
+  leg's overall delay-bucket history (how often has this train been at least N minutes
+  late), not on how the specific pair of trains at this specific transfer have performed
+  together, and it doesn't account for correlated delays across legs (e.g. one disruption
+  hitting both). Said plainly in `main.py`'s `_connection_success_probability()`
+  docstring and in the API response itself isn't currently flagged to the caller beyond
+  that -- worth adding a `note` to the top-level `/api/search` response if this ships to
+  real users, not just the code comment.
 
 ## Files
 
@@ -85,5 +145,7 @@ here -- this MVP is just the app itself).
 |---|---|
 | `main.py` | FastAPI app, all endpoints. |
 | `db.py` | Read-only connection helper + small utilities duplicated (not imported) from `tchoutchou_ingest/` -- UIC extraction, train nomenclature fallback, mission-code detection. Kept as a separate copy since this is a different deployable that only reads the collector's db. |
+| `sncf_journeys.py` | Client for SNCF's journey-planning API (added 2026-08-24) -- station-name resolution, journey search, response parsing. See "SNCF journey search setup" above. |
 | `static/index.html` | Self-contained single-page UI (no build step, no external dependencies) -- train number search box that calls the combined endpoint and renders the result. |
-| `requirements.txt` | `fastapi`, `uvicorn[standard]`. |
+| `requirements.txt` | `fastapi`, `uvicorn[standard]`, `requests`. |
+| `test_search_local.py` | No-network sanity check for `/api/search`'s parsing and connection-risk math, run against a hand-built SNCF-shaped response -- `python test_search_local.py`. Doesn't need `SNCF_API_KEY`; doesn't replace testing against a real response once you have a key. |

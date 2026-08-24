@@ -262,11 +262,58 @@ CREATE TABLE IF NOT EXISTS station_stats (
     sum_arrival_delay_sq     INTEGER NOT NULL DEFAULT 0,
     on_time_count            INTEGER NOT NULL DEFAULT 0,
     late_5_count             INTEGER NOT NULL DEFAULT 0,
-    late_15_count            INTEGER NOT NULL DEFAULT 0,
-    late_30_count            INTEGER NOT NULL DEFAULT 0,
+    late_15_count             INTEGER NOT NULL DEFAULT 0,
+    late_30_count             INTEGER NOT NULL DEFAULT 0,
     updated_at_utc           TEXT NOT NULL,
     PRIMARY KEY (station_uic, train_type, day_type)
 );
+
+-- One row per (trip_id, start_date, stop_id) -- the "trip-finals" tier, sitting between
+-- the raw per-poll layer (full history, purged after --retention-days) and the
+-- permanent layer above (sums/counts only, no per-trip detail). Written once by
+-- aggregate.py at the same time as train_station_stats/station_stats, from data it
+-- already has in memory -- no extra raw scan. Kept far longer than the raw layer (small:
+-- one row per trip x stop, not one row per poll x stop) so per-trip questions like "how
+-- accurate was SNCF's prediction 30 minutes out vs 5 minutes out" stay answerable long
+-- after the raw polls themselves are gone.
+--
+-- Uses the SAME final_by_stop resolution as train_station_stats (one row per stop_id per
+-- trip) -- including its known limitation that a trip visiting the same stop_id twice
+-- (see the station-87640912 "Car TER replacement bus" investigation, 2026-08-23) only
+-- gets one settled row here too. Deliberately not fixed here -- fixing the underlying
+-- resolution is tracked as separate future work, and trip_finals should stay consistent
+-- with train_station_stats' notion of "one observation per stop" rather than introduce a
+-- second, different disambiguation scheme that the two tables would disagree on.
+--
+-- delay_at_t30/t15/t5: the most recently known predicted arrival_delay as of
+-- (scheduled_arrival_epoch - 30/15/5 minutes) -- i.e. "what did SNCF say this stop's
+-- delay would be, N minutes before it was due". NULL if polling hadn't started yet by
+-- that point (trip picked up less than N minutes before its scheduled arrival) or the
+-- stop has no scheduled_arrival_epoch to anchor against (arrival_time/arrival_delay both
+-- ever-null for this stop -- falls back to the departure pair, see
+-- compute_trip_final_checkpoints() in aggregate.py).
+CREATE TABLE IF NOT EXISTS trip_finals (
+    trip_id                    TEXT NOT NULL,
+    start_date                  TEXT NOT NULL,
+    stop_id                     TEXT NOT NULL,          -- raw stop_id as received, not just the extracted UIC
+    station_uic                 TEXT,
+    train_number                TEXT,
+    direction_id                 INTEGER,
+    day_type                     TEXT,
+    train_type                   TEXT,
+    scheduled_arrival_epoch      INTEGER,                -- derived: final arrival_time - final arrival_delay
+    final_arrival_delay          INTEGER,
+    final_arrival_time            INTEGER,
+    scheduled_departure_epoch    INTEGER,
+    final_departure_delay         INTEGER,
+    final_departure_time          INTEGER,
+    delay_at_t30                  INTEGER,                -- predicted arrival_delay ~30 min before scheduled arrival
+    delay_at_t15                  INTEGER,
+    delay_at_t5                   INTEGER,
+    created_at_utc                 TEXT NOT NULL,
+    PRIMARY KEY (trip_id, start_date, stop_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trip_finals_train_station ON trip_finals(train_number, station_uic);
 
 -- ============================================================================
 -- PLATFORM LAYER -- SIRI ET Lite feed (XML, not protobuf -- see siri_parse.py and

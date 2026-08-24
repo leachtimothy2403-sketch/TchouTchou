@@ -7,6 +7,10 @@ deep-link to SNCF Connect for booking. Crowd insights has no underlying data sou
 (see /trains/{train_number}/crowd) -- stubbed honestly rather than faked, see its
 docstring.
 
+Also serves /api/search (added 2026-08-24): real train search backed by SNCF's own
+journey-planning API (see sncf_journeys.py), with each option annotated by TchouTchou's
+reliability data -- needs SNCF_API_KEY set, see README.md "SNCF journey search setup".
+
 Run (either works the same):
     pip install -r requirements.txt
     TCHOUTCHOU_DB=tchoutchou.db python main.py
@@ -26,11 +30,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from db import get_conn, extract_uic, train_label, is_mission_code, station_name
+import sncf_journeys
 
 app = FastAPI(title="TchouTchou API", version="0.1.0")
 
@@ -239,80 +244,91 @@ def train_status(train_number: str, date: Optional[str] = None):
 # 2. Reliability score
 # ---------------------------------------------------------------------------
 
-@app.get("/api/trains/{train_number}/reliability")
-def train_reliability(train_number: str):
+def _reliability_summary(conn, train_number: str):
     """
     Punctuality stats from the permanent layer (train_stats, built daily by
-    aggregate.py). README.md is explicit that this needs 2-4 weeks of history to mean
-    anything -- collection started 2026-08-17, so treat any number here as provisional
-    until first_seen_date is old enough. days_of_history is always included so a caller
-    can decide whether to show/hide the score rather than guessing.
+    aggregate.py). Shared by the /reliability endpoint and /api/search's per-leg
+    annotation -- pulled out (2026-08-24) so both use exactly the same computation
+    instead of a second copy that could quietly drift from this one.
+
+    README.md is explicit that this needs 2-4 weeks of history to mean anything --
+    collection started 2026-08-17, so treat any number here as provisional until
+    first_seen_date is old enough. days_of_history is always included so a caller can
+    decide whether to show/hide the score rather than guessing.
     """
-    with get_conn() as conn:
-        train = conn.execute(
-            "SELECT train_number, train_type, first_seen_date, last_seen_date, trips_observed "
-            "FROM trains WHERE train_number = ?", (train_number,),
-        ).fetchone()
-        rows = conn.execute(
-            "SELECT day_type, observations, cancelled_count, sum_final_delay, "
-            "on_time_count, late_5_count, late_15_count, late_30_count "
-            "FROM train_stats WHERE train_number = ?", (train_number,),
-        ).fetchall()
+    train = conn.execute(
+        "SELECT train_number, train_type, first_seen_date, last_seen_date, trips_observed "
+        "FROM trains WHERE train_number = ?", (train_number,),
+    ).fetchone()
+    rows = conn.execute(
+        "SELECT day_type, observations, cancelled_count, sum_final_delay, "
+        "on_time_count, late_5_count, late_15_count, late_30_count "
+        "FROM train_stats WHERE train_number = ?", (train_number,),
+    ).fetchall()
 
-        if not rows:
-            return {
-                "train_number": train_number,
-                "available": False,
-                "reason": "No aggregated history yet -- either aggregate.py hasn't processed "
-                          "any trips for this train (needs a trip at least 1 day old), or this "
-                          "train has never been observed. Try again once the collector has run "
-                          "at least a day or two.",
-            }
-
-        days_of_history = None
-        if train and train["first_seen_date"]:
-            first = datetime.strptime(train["first_seen_date"], "%Y%m%d").date()
-            last = datetime.strptime(train["last_seen_date"], "%Y%m%d").date() if train["last_seen_date"] else first
-            days_of_history = (last - first).days + 1
-
-        by_day_type = {}
-        total = {"observations": 0, "cancelled_count": 0, "sum_final_delay": 0,
-                 "on_time_count": 0, "late_5_count": 0, "late_15_count": 0, "late_30_count": 0}
-        for r in rows:
-            obs = r["observations"]
-            entry = {
-                "observations": obs,
-                "cancelled_count": r["cancelled_count"],
-                "mean_delay_minutes": round(r["sum_final_delay"] / obs / 60, 1) if obs else None,
-                "on_time_pct": round(r["on_time_count"] / obs * 100, 1) if obs else None,
-                "late_5_pct": round(r["late_5_count"] / obs * 100, 1) if obs else None,
-                "late_15_pct": round(r["late_15_count"] / obs * 100, 1) if obs else None,
-                "late_30_pct": round(r["late_30_count"] / obs * 100, 1) if obs else None,
-            }
-            by_day_type[r["day_type"]] = entry
-            for k in total:
-                total[k] += r[k] or 0
-
-        obs = total["observations"]
-        overall = {
-            "observations": obs,
-            "cancelled_count": total["cancelled_count"],
-            "mean_delay_minutes": round(total["sum_final_delay"] / obs / 60, 1) if obs else None,
-            "on_time_pct": round(total["on_time_count"] / obs * 100, 1) if obs else None,
-        } if obs else None
-
+    if not rows:
         return {
             "train_number": train_number,
-            "available": True,
-            "days_of_history": days_of_history,
-            "confidence_note": (
-                "Based on limited data (< 2 weeks of collection) -- treat as provisional, "
-                "not a stable reliability figure. See README.md 'Why 48 hours probably "
-                "isn't enough'." if (days_of_history or 0) < 14 else None
-            ),
-            "overall": overall,
-            "by_day_type": by_day_type,
+            "available": False,
+            "reason": "No aggregated history yet -- either aggregate.py hasn't processed "
+                      "any trips for this train (needs a trip at least 1 day old), or this "
+                      "train has never been observed. Try again once the collector has run "
+                      "at least a day or two.",
         }
+
+    days_of_history = None
+    if train and train["first_seen_date"]:
+        first = datetime.strptime(train["first_seen_date"], "%Y%m%d").date()
+        last = datetime.strptime(train["last_seen_date"], "%Y%m%d").date() if train["last_seen_date"] else first
+        days_of_history = (last - first).days + 1
+
+    by_day_type = {}
+    total = {"observations": 0, "cancelled_count": 0, "sum_final_delay": 0,
+             "on_time_count": 0, "late_5_count": 0, "late_15_count": 0, "late_30_count": 0}
+    for r in rows:
+        obs = r["observations"]
+        entry = {
+            "observations": obs,
+            "cancelled_count": r["cancelled_count"],
+            "mean_delay_minutes": round(r["sum_final_delay"] / obs / 60, 1) if obs else None,
+            "on_time_pct": round(r["on_time_count"] / obs * 100, 1) if obs else None,
+            "late_5_pct": round(r["late_5_count"] / obs * 100, 1) if obs else None,
+            "late_15_pct": round(r["late_15_count"] / obs * 100, 1) if obs else None,
+            "late_30_pct": round(r["late_30_count"] / obs * 100, 1) if obs else None,
+        }
+        by_day_type[r["day_type"]] = entry
+        for k in total:
+            total[k] += r[k] or 0
+
+    obs = total["observations"]
+    overall = {
+        "observations": obs,
+        "cancelled_count": total["cancelled_count"],
+        "mean_delay_minutes": round(total["sum_final_delay"] / obs / 60, 1) if obs else None,
+        "on_time_pct": round(total["on_time_count"] / obs * 100, 1) if obs else None,
+        "late_5_pct": round(total["late_5_count"] / obs * 100, 1) if obs else None,
+        "late_15_pct": round(total["late_15_count"] / obs * 100, 1) if obs else None,
+        "late_30_pct": round(total["late_30_count"] / obs * 100, 1) if obs else None,
+    } if obs else None
+
+    return {
+        "train_number": train_number,
+        "available": True,
+        "days_of_history": days_of_history,
+        "confidence_note": (
+            "Based on limited data (< 2 weeks of collection) -- treat as provisional, "
+            "not a stable reliability figure. See README.md 'Why 48 hours probably "
+            "isn't enough'." if (days_of_history or 0) < 14 else None
+        ),
+        "overall": overall,
+        "by_day_type": by_day_type,
+    }
+
+
+@app.get("/api/trains/{train_number}/reliability")
+def train_reliability(train_number: str):
+    with get_conn() as conn:
+        return _reliability_summary(conn, train_number)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +395,165 @@ def train_deep_link(train_number: str, date: Optional[str] = None):
                 "live site -- open this link and check it actually prefills the search "
                 "before relying on it. If it doesn't, the safe fallback is linking to the "
                 "homepage and asking the user to search manually.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Journey search -- real itineraries from SNCF's journey-planning API, annotated
+#    with TchouTchou's own reliability data. Added 2026-08-24 to back the "search for a
+#    ticket and see which option is most reliable" feature (see the search-results
+#    mockup) -- previously that screen only had sample data.
+# ---------------------------------------------------------------------------
+
+def _connection_success_probability(reliability, buffer_minutes):
+    """
+    Rough estimate of P(the traveler makes this connection), grounded in the INCOMING
+    leg's own delay-bucket history (train_stats' on_time/late_5/late_15/late_30 counts,
+    which are cumulative -- "at least this late", see aggregate.py's bucket_counts())
+    compared against the scheduled transfer buffer SNCF's API gave us.
+
+    This is a first-pass approximation, not the full historical buffer-time model
+    discussed in the product design conversation (which would need history keyed on the
+    specific pair of trains at this specific transfer point, not just one leg's overall
+    delay distribution). It answers "how often has this train historically been at least
+    this late," which is a reasonable proxy but ignores correlation between the two legs
+    (e.g. a shared disruption delaying both at once) -- flagged here, not hidden. Revisit
+    if/when trip_finals' T-30/T-15/T-5 checkpoints (see tchoutchou_r2_storage.md) are
+    deployed and give a finer-grained, transfer-time-aware signal to build this on.
+
+    Returns (probability_pct_or_None, note_or_None).
+    """
+    if buffer_minutes is None:
+        return None, "Transfer time unknown."
+    if buffer_minutes < 0:
+        return 0.0, "SNCF's schedule shows this connection as physically impossible (arrival after departure)."
+
+    overall = (reliability or {}).get("overall")
+    if not reliability or not reliability.get("available") or not overall or not overall.get("observations"):
+        return None, "No reliability history yet for the incoming train."
+
+    # late_5_pct == 100 - on_time_pct exactly (same 5-minute threshold on both sides, see
+    # aggregate.py), so the <5min and <15min buffer cases collapse to the same bucket.
+    if buffer_minutes < 15:
+        p_miss = overall.get("late_5_pct")
+    elif buffer_minutes < 30:
+        p_miss = overall.get("late_15_pct")
+    else:
+        p_miss = overall.get("late_30_pct")
+
+    if p_miss is None:
+        return None, "Not enough delay-bucket history for this train yet."
+
+    return round(max(0.0, min(100.0, 100 - p_miss)), 1), None
+
+
+def _combined_probability(legs, transfers):
+    """End-to-end probability for a multi-leg itinerary: the product of each transfer's
+    connection-success probability and the final leg not being cancelled. Deliberately
+    NOT the product of each leg's independent on-time percentage -- see the product
+    design discussion (tchoutchou_monetization_mvp.md) on why that both misstates the
+    real question (making the connection vs. each train individually being on time) and
+    ignores correlated delays. Returns (probability_pct_or_None, list_of_notes)."""
+    if not legs:
+        return None, []
+
+    notes = []
+    p = 1.0
+    have_any = False
+
+    for t in transfers:
+        if t["connection_success_probability"] is None:
+            if t.get("note"):
+                notes.append(t["note"])
+            continue
+        have_any = True
+        p *= t["connection_success_probability"] / 100
+
+    last_leg_reliability = legs[-1]["reliability"]
+    if last_leg_reliability and last_leg_reliability.get("available"):
+        overall = last_leg_reliability.get("overall") or {}
+        obs = overall.get("observations")
+        cancelled = overall.get("cancelled_count")
+        if obs:
+            have_any = True
+            p *= 1 - (cancelled / obs)
+    else:
+        notes.append("No reliability/cancellation history yet for the final train.")
+
+    if not have_any:
+        return None, notes
+    return round(p * 100, 1), notes
+
+
+def _annotate_journey(conn, journey):
+    legs = []
+    for leg in journey["legs"]:
+        reliability = _reliability_summary(conn, leg["train_number"]) if leg["train_number"] else None
+        legs.append({**leg, "reliability": reliability})
+
+    transfers = []
+    for i, t in enumerate(journey["transfers"]):
+        p_connect, note = _connection_success_probability(legs[i]["reliability"], t["buffer_minutes"])
+        transfers.append({**t, "connection_success_probability": p_connect, "note": note})
+
+    combined_probability, combined_notes = _combined_probability(legs, transfers)
+
+    return {
+        **{k: v for k, v in journey.items() if k not in ("legs", "transfers")},
+        "legs": legs,
+        "transfers": transfers,
+        "combined_success_probability": combined_probability,
+        "combined_probability_notes": combined_notes,
+    }
+
+
+@app.get("/api/search")
+def search(
+    from_: str = Query(..., alias="from", description="Origin station name, e.g. 'Paris Gare de Lyon'"),
+    to: str = Query(..., description="Destination station name, e.g. 'Lyon Part-Dieu'"),
+    date: str = Query(..., description="YYYY-MM-DD"),
+    time: str = Query("08:00", description="HH:MM, requested departure time"),
+    count: int = Query(5, ge=1, le=10),
+):
+    """
+    Real train search: calls SNCF's journey-planning API (see sncf_journeys.py) for
+    itinerary options between two stations, then annotates each leg with TchouTchou's own
+    reliability data and a connection-risk-adjusted end-to-end probability for
+    itineraries with a change. Backs the search-results screen (previously mockup-only
+    sample data).
+
+    Needs SNCF_API_KEY set -- see README.md "SNCF journey search setup". Returns 502 with
+    a plain-English reason if the SNCF API call fails (missing/bad key, quota exhausted,
+    unreachable, or an unknown station name) rather than a bare stack trace.
+
+    KNOWN GAP, same caveat as sncf_journeys.py's module docstring: this hasn't been
+    exercised against a real SNCF API response yet (no key was available while building
+    it) -- the journey/section shape is well-established Navitia surface, but exactly
+    where the commercial train number lives in SNCF's own coverage is inferred, not
+    confirmed. If train_number comes back null or wrong for real results, that's the
+    first thing to check (sncf_journeys.py's _extract_train_number()).
+    """
+    try:
+        journeys = sncf_journeys.search_journeys(from_, to, date, time, count=count)
+    except sncf_journeys.SNCFAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    with get_conn() as conn:
+        results = [_annotate_journey(conn, j) for j in journeys]
+
+    return {
+        "from": from_,
+        "to": to,
+        "date": date,
+        "time": time,
+        "results": results,
+        "combined_probability_methodology_note": (
+            "combined_success_probability is a first-pass estimate based on each train's "
+            "own historical delay-bucket distribution vs. the scheduled transfer time -- "
+            "not a model of how this specific pair of trains has performed together at "
+            "this specific transfer, and it doesn't account for correlated delays across "
+            "legs (e.g. one disruption affecting both). Treat it as directional, not exact."
+        ),
     }
 
 
