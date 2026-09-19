@@ -42,6 +42,18 @@ rem Non-zero exit here just means hard mismatches remain (e.g. the known station
 rem cluster) -- logged for visibility, not treated as a pipeline failure.
 .venv\Scripts\python.exe verify_aggregate.py --db tchoutchou.db >> daily_maintenance.log 2>&1
 
-.venv\Scripts\python.exe purge_raw.py --db tchoutchou.db --retention-days 5 --vacuum >> daily_maintenance.log 2>&1
+.venv\Scripts\python.exe purge_raw.py --db tchoutchou.db --retention-days 5 >> daily_maintenance.log 2>&1
+
+rem Platform layer (platform_journeys/platform_calls) has no expiry of its own -- see
+rem purge_platform.py's docstring and tchoutchou_r2_storage.md. Same aggregated-first
+rem safety gate as purge_raw.py above. Retention here can be much shorter than the raw
+rem layer's 5 days since this is settled per-day summary data, not investigative detail.
+.venv\Scripts\python.exe purge_platform.py --db tchoutchou.db --retention-days 30 >> daily_maintenance.log 2>&1
+
+rem NOTE: --vacuum deliberately removed from both purge calls above (2026-09-19).
+rem VACUUM needs ~2x the db's CURRENT size in free disk to run, and running it nightly
+rem unattended on a disk that may be near-full risks the VACUUM itself failing/filling
+rem the disk mid-run. Run VACUUM manually, by hand, only after confirming free space >=
+rem the db file size -- see tchoutchou_r2_storage.md for the 2026-09-19 disk-pressure notes.
 
 echo %date% %time% - daily maintenance complete >> daily_maintenance.log
