@@ -50,6 +50,10 @@ rem safety gate as purge_raw.py above. Retention here can be much shorter than t
 rem layer's 5 days since this is settled per-day summary data, not investigative detail.
 .venv\Scripts\python.exe purge_platform.py --db tchoutchou.db --retention-days 30 >> daily_maintenance.log 2>&1
 
+rem 2026-10-01 (disk full at db=21GB): keep the snapshots.raw_gzip safety-net blobs for
+rem 24h only. Parsed rows keep their full 5-day window; only the raw protobuf copies go.
+.venv\Scripts\python.exe strip_raw_blobs.py --db tchoutchou.db --keep-hours 24 >> daily_maintenance.log 2>&1
+
 rem NOTE: --vacuum deliberately removed from both purge calls above (2026-09-19).
 rem VACUUM needs ~2x the db's CURRENT size in free disk to run, and running it nightly
 rem unattended on a disk that may be near-full risks the VACUUM itself failing/filling
