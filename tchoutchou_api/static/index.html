@@ -95,6 +95,18 @@
 </div>
 
 <script>
+// App key support (2026-10-06): when the server has TCHOUTCHOU_APP_KEYS set, open this
+// page once as  ...?key=YOUR_KEY  -- the key is remembered in this browser afterwards.
+const APP_KEY = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('key');
+  try {
+    if (fromUrl) localStorage.setItem('tchoutchou_app_key', fromUrl);
+    return fromUrl || localStorage.getItem('tchoutchou_app_key') || '';
+  } catch (e) { return fromUrl || ''; }
+})();
+const apiFetch = (url) => fetch(url, APP_KEY ? { headers: { 'X-App-Key': APP_KEY } } : {});
+</script>
+<script>
 const form = document.getElementById('searchForm');
 const results = document.getElementById('results');
 
@@ -106,7 +118,7 @@ form.addEventListener('submit', async (e) => {
   results.innerHTML = '<div class="panel">Loading…</div>';
   try {
     const qs = date ? `?date=${encodeURIComponent(date)}` : '';
-    const res = await fetch(`/api/trains/${encodeURIComponent(trainNumber)}${qs}`);
+    const res = await apiFetch(`/api/trains/${encodeURIComponent(trainNumber)}${qs}`);
     const data = await res.json();
     render(data, trainNumber);
   } catch (err) {

@@ -29,3 +29,8 @@ Export_OpenData_SNCF_GTFS_NewTripId.zip
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# API deployment secrets / runtime files (see tchoutchou_api/deploy/README_TUNNEL.md)
+tchoutchou_api/deploy/api_env.bat
+tchoutchou_api/deploy/tunnel_url.txt
+tchoutchou_api/deploy/tunnel.log

@@ -33,10 +33,14 @@ established, widely-used public API surface, confirmed by the real response abov
 """
 import os
 import re
+import threading
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
+
+_PARIS = ZoneInfo("Europe/Paris")
 
 SNCF_API_BASE = "https://api.sncf.com/v1"
 COVERAGE = "sncf"
@@ -67,8 +71,49 @@ def _api_key():
     return key
 
 
+# ---------------------------------------------------------------------------
+# Daily budget on real upstream calls (added 2026-10-06 for public/mobile exposure).
+# Cache hits never reach _get(), so only genuine SNCF calls count. Default 4,500 leaves
+# headroom under the 5,000/day free tier for manual testing with the same key. Resets at
+# midnight Paris time, which is when SNCF's own quota day is assumed to roll over
+# (unverified -- if 429s appear before the budget is reached, lower SNCF_DAILY_BUDGET).
+# In-memory: a restart resets the count, so it's a guard rail, not an exact ledger.
+# ---------------------------------------------------------------------------
+
+_budget_lock = threading.Lock()
+_budget = {"day": None, "used": 0}
+
+
+def _daily_budget():
+    try:
+        return int(os.environ.get("SNCF_DAILY_BUDGET", "4500"))
+    except ValueError:
+        return 4500
+
+
+def _consume_budget():
+    today = datetime.now(_PARIS).strftime("%Y-%m-%d")
+    with _budget_lock:
+        if _budget["day"] != today:
+            _budget["day"] = today
+            _budget["used"] = 0
+        if _budget["used"] >= _daily_budget():
+            raise SNCFAPIError(
+                "Daily search budget reached -- journey search is paused until midnight "
+                "(protects the SNCF free-tier quota). Cached searches still work."
+            )
+        _budget["used"] += 1
+
+
+def budget_status():
+    with _budget_lock:
+        return {"day": _budget["day"], "used": _budget["used"], "limit": _daily_budget()}
+
+
 def _get(path, params=None):
     url = f"{SNCF_API_BASE}{path}"
+    _api_key()  # fail fast on a missing key without spending budget
+    _consume_budget()
     try:
         # HTTP Basic auth: the token is the username, password is left empty -- see
         # digital.sncf.com's integration guide.
@@ -206,6 +251,8 @@ def _parse_journey(journey, origin_name, destination_name):
             "train_number": _extract_train_number(di),
             "operator": di.get("network"),
             "physical_mode": di.get("physical_mode"),
+            "commercial_mode": di.get("commercial_mode"),  # e.g. "TER", "TGV INOUI" -- used as a
+                # train-type hint for trains the collector has never seen (see confidence.py)
             "headsign": di.get("headsign"),
             "from_station": (section.get("from") or {}).get("name"),
             "to_station": (section.get("to") or {}).get("name"),

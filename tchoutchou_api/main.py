@@ -26,18 +26,40 @@ foreground; for an unattended run see "Deploying" in README.md.
 Run this next to wherever the live db actually is (the VPS, for real-time data) -- see
 tchoutchou_api/README.md.
 """
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from db import get_conn, extract_uic, train_label, is_mission_code, station_name
+import confidence
+import security
 import sncf_journeys
+import stations_search
 
-app = FastAPI(title="TchouTchou API", version="0.1.0")
+API_VERSION = "0.2.0"
+app = FastAPI(title="TchouTchou API", version=API_VERSION)
+
+# App key + rate limits for public exposure (see security.py). No-ops for the key check
+# when TCHOUTCHOU_APP_KEYS is unset, so local dev is unchanged.
+app.middleware("http")(security.protect)
+
+# CORS: only needed for browser clients on another origin (e.g. the Expo app running in
+# a web browser during development, http://localhost:8081). The native iOS/Android app
+# and the same-origin /static pages don't need it. Comma-separated list, or "*".
+_cors = [o.strip() for o in os.environ.get("TCHOUTCHOU_CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors,
+        allow_methods=["GET", "OPTIONS"],
+        allow_headers=["X-App-Key", "X-Device-Id", "Accept-Language"],
+    )
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
@@ -244,7 +266,7 @@ def train_status(train_number: str, date: Optional[str] = None):
 # 2. Reliability score
 # ---------------------------------------------------------------------------
 
-def _reliability_summary(conn, train_number: str):
+def _reliability_summary(conn, train_number: str, type_hint: Optional[str] = None):
     """
     Punctuality stats from the permanent layer (train_stats, built daily by
     aggregate.py). Shared by the /reliability endpoint and /api/search's per-leg
@@ -266,14 +288,22 @@ def _reliability_summary(conn, train_number: str):
         "FROM train_stats WHERE train_number = ?", (train_number,),
     ).fetchall()
 
+    train_type = (train["train_type"] if train else None) or type_hint
+    type_fallback = confidence.type_stats(conn, train_type)
+
     if not rows:
+        empty_conf = confidence.confidence_block(0, 0)
         return {
             "train_number": train_number,
             "available": False,
+            "train_type": train_type,
             "reason": "No aggregated history yet -- either aggregate.py hasn't processed "
                       "any trips for this train (needs a trip at least 1 day old), or this "
                       "train has never been observed. Try again once the collector has run "
                       "at least a day or two.",
+            "confidence": empty_conf,
+            "type_fallback": type_fallback,
+            "headline": confidence.headline(None, empty_conf, type_fallback),
         }
 
     days_of_history = None
@@ -295,6 +325,7 @@ def _reliability_summary(conn, train_number: str):
             "late_5_pct": round(r["late_5_count"] / obs * 100, 1) if obs else None,
             "late_15_pct": round(r["late_15_count"] / obs * 100, 1) if obs else None,
             "late_30_pct": round(r["late_30_count"] / obs * 100, 1) if obs else None,
+            "confidence": confidence.confidence_block(obs, r["on_time_count"]),
         }
         by_day_type[r["day_type"]] = entry
         for k in total:
@@ -311,9 +342,15 @@ def _reliability_summary(conn, train_number: str):
         "late_30_pct": round(total["late_30_count"] / obs * 100, 1) if obs else None,
     } if obs else None
 
+    train_conf = confidence.confidence_block(obs, total["on_time_count"])
+
     return {
         "train_number": train_number,
         "available": True,
+        "train_type": train_type,
+        "confidence": train_conf,
+        "type_fallback": type_fallback,
+        "headline": confidence.headline(overall, train_conf, type_fallback),
         "days_of_history": days_of_history,
         "confidence_note": (
             "Based on limited data (< 2 weeks of collection) -- treat as provisional, "
@@ -428,23 +465,62 @@ def _connection_success_probability(reliability, buffer_minutes):
     if buffer_minutes < 0:
         return 0.0, "SNCF's schedule shows this connection as physically impossible (arrival after departure)."
 
-    overall = (reliability or {}).get("overall")
-    if not reliability or not reliability.get("available") or not overall or not overall.get("observations"):
-        return None, "No reliability history yet for the incoming train."
-
-    # late_5_pct == 100 - on_time_pct exactly (same 5-minute threshold on both sides, see
-    # aggregate.py), so the <5min and <15min buffer cases collapse to the same bucket.
-    if buffer_minutes < 15:
-        p_miss = overall.get("late_5_pct")
-    elif buffer_minutes < 30:
-        p_miss = overall.get("late_15_pct")
-    else:
-        p_miss = overall.get("late_30_pct")
-
+    overall, fallback_note = _connection_stats(reliability)
+    if overall is None:
+        return None, fallback_note
+    p_miss = _miss_pct(overall, buffer_minutes)
     if p_miss is None:
         return None, "Not enough delay-bucket history for this train yet."
 
-    return round(max(0.0, min(100.0, 100 - p_miss)), 1), None
+    return round(max(0.0, min(100.0, 100 - p_miss)), 1), fallback_note
+
+
+def _connection_stats(reliability):
+    """Which delay history a connection estimate rests on: the incoming train's own once
+    it's above "insufficient" (see confidence.py), otherwise its train type's (e.g. all
+    TER), with a note saying so. Payloads without a confidence block (older callers/tests)
+    behave exactly as before. Returns (stats_or_None, note_or_None)."""
+    reliability = reliability or {}
+    overall = reliability.get("overall") if reliability.get("available") else None
+    own_obs = (overall or {}).get("observations") or 0
+    tier = (reliability.get("confidence") or {}).get("tier")
+    if overall and own_obs and tier == "insufficient" and reliability.get("type_fallback"):
+        overall = None  # too thin -- prefer the robust type-level figure below
+    if overall and overall.get("observations"):
+        return overall, None
+    tf = reliability.get("type_fallback")
+    if not tf:
+        return None, "No reliability history yet for the incoming train."
+    return tf, (f"Estimated from all {tf['train_type']} trains -- this train has "
+                f"only {own_obs} recorded trip(s).")
+
+
+def _miss_pct(overall, buffer_minutes):
+    # late_5_pct == 100 - on_time_pct exactly (same 5-minute threshold on both sides, see
+    # aggregate.py), so the <5min and <15min buffer cases collapse to the same bucket.
+    if buffer_minutes < 15:
+        return overall.get("late_5_pct")
+    if buffer_minutes < 30:
+        return overall.get("late_15_pct")
+    return overall.get("late_30_pct")
+
+
+def _connection_success_low(reliability, buffer_minutes):
+    """Cautious end (95% Wilson lower bound) of the same connection estimate, using the
+    sample size of whichever history it rests on. None when the estimate itself is None."""
+    if buffer_minutes is None:
+        return None
+    if buffer_minutes < 0:
+        return 0.0
+    overall, _ = _connection_stats(reliability)
+    if overall is None:
+        return None
+    p_miss = _miss_pct(overall, buffer_minutes)
+    n = overall.get("observations") or 0
+    if p_miss is None or not n:
+        return None
+    ci = confidence.wilson_interval(round((100 - p_miss) / 100 * n), n)
+    return ci[0] if ci else None
 
 
 def _combined_probability(legs, transfers):
@@ -476,6 +552,8 @@ def _combined_probability(legs, transfers):
             if t.get("note"):
                 notes.append(t["note"])
             return None, notes
+        if t.get("note"):
+            notes.append(t["note"])
         p *= t["connection_success_probability"] / 100
 
     have_cancellation_data = False
@@ -495,10 +573,81 @@ def _combined_probability(legs, transfers):
     return round(p * 100, 1), notes
 
 
+def _arrival_on_time_probability(legs, combined):
+    """ONE comparable number per itinerary, so direct trains and trips with changes can be
+    ranked (and shown) on the same scale -- added 2026-10-07.
+
+    Before this, a direct train was scored by its own on-time % while a trip with a change
+    was scored by its odds of merely *making the connections* (which ignores lateness), so a
+    90% connection could outrank a direct train that is 77% on time even though the direct
+    one almost always gets you there. Now:
+
+      direct trip      -> the train's headline on-time % (unchanged)
+      trip with change -> P(every change made and the last train not cancelled)
+                          x the last train's on-time %
+
+    i.e. "chance of making every change and arriving on time". Unknown (None) whenever a
+    piece is unknown -- never a guess. Still a first-pass estimate: it treats the last
+    train's lateness as independent of the earlier delays.
+    """
+    if not legs:
+        return None
+    headline = ((legs[-1].get("reliability") or {}).get("headline")) or {}
+    on_time = headline.get("on_time_pct")
+    if on_time is None:
+        return None
+    if len(legs) == 1:
+        return on_time
+    if combined is None:
+        return None
+    return round(combined * on_time / 100, 1)
+
+
+def _on_time_low(reliability):
+    """Low end of the 95% range behind a leg's headline on-time % -- the train's own, or
+    its train type's when the headline comes from the type."""
+    reliability = reliability or {}
+    source = (reliability.get("headline") or {}).get("source")
+    if source == "train":
+        ci = (reliability.get("confidence") or {}).get("on_time_ci95")
+    elif source == "train_type":
+        ci = (reliability.get("type_fallback") or {}).get("on_time_ci95")
+    else:
+        return None
+    return ci[0] if ci else None
+
+
+def _ranking_score(legs, transfers):
+    """What "most reliable" sorts by (added 2026-10-07): the same quantity as
+    arrival_on_time_probability, but built from the cautious end of each estimate (95%
+    Wilson lower bounds) instead of the point values. A train that was on time 6 of 7
+    trips (86%, range ~49-97%) then ranks below one on time 46 of 60 (77%, range ~65-86%):
+    the second is known, the first could be anything. Displayed numbers don't change.
+    None whenever any piece is unknown, so unknowns sort last."""
+    if not legs:
+        return None
+    low = _on_time_low(legs[-1].get("reliability"))
+    if low is None:
+        return None
+    p = low / 100
+    for i, t in enumerate(transfers):
+        c = _connection_success_low(legs[i].get("reliability"), t.get("buffer_minutes"))
+        if c is None:
+            return None
+        p *= c / 100
+    if transfers:
+        overall = ((legs[-1].get("reliability") or {}).get("overall")) or {}
+        obs, cancelled = overall.get("observations"), overall.get("cancelled_count")
+        if obs:
+            p *= 1 - cancelled / obs
+    return round(p * 100, 1)
+
+
 def _annotate_journey(conn, journey):
     legs = []
     for leg in journey["legs"]:
-        reliability = _reliability_summary(conn, leg["train_number"]) if leg["train_number"] else None
+        reliability = (_reliability_summary(conn, leg["train_number"], leg.get("commercial_mode"))
+                       if leg["train_number"] else None)
         legs.append({**leg, "reliability": reliability})
 
     transfers = []
@@ -514,6 +663,8 @@ def _annotate_journey(conn, journey):
         "transfers": transfers,
         "combined_success_probability": combined_probability,
         "combined_probability_notes": combined_notes,
+        "arrival_on_time_probability": _arrival_on_time_probability(legs, combined_probability),
+        "ranking_score": _ranking_score(legs, transfers),
     }
 
 
@@ -567,6 +718,35 @@ def search(
             "legs (e.g. one disruption affecting both). Treat it as directional, not exact."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 6. Station autocomplete + health (added 2026-10-06 for the mobile app)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/stations")
+def stations(q: str = Query(..., min_length=1, max_length=80), limit: int = Query(8, ge=1, le=20)):
+    """Station-name autocomplete for the search form -- local stations table first (free),
+    SNCF /places only as a fallback. See stations_search.py."""
+    with get_conn() as conn:
+        return {"q": q, "results": stations_search.search(conn, q, limit)}
+
+
+@app.get("/api/health")
+def health():
+    """Unauthenticated liveness check (exempt from the app key) -- the app pings this to
+    tell "server unreachable" apart from "bad key" or "no results". Also reports how
+    fresh the aggregated data is, so a stalled nightly aggregate shows up somewhere."""
+    info = {"ok": True, "version": API_VERSION}
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT MAX(updated_at_utc) AS u FROM train_stats").fetchone()
+            info["stats_updated_at_utc"] = row["u"] if row else None
+    except Exception as e:  # db missing/locked -- still answer, but say so
+        info["ok"] = False
+        info["db_error"] = str(e)[:200]
+    info["sncf_budget"] = sncf_journeys.budget_status()
+    return info
 
 
 # ---------------------------------------------------------------------------

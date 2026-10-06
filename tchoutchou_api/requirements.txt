@@ -6,3 +6,6 @@ requests   # sncf_journeys.py: outbound calls to SNCF's journey-planning API
 # ZoneInfo("Europe/Paris") raises ZoneInfoNotFoundError. Not needed on Linux/Mac (the VPS
 # is Windows, per HANDOFF.md, so this is required there).
 tzdata
+
+# Only needed to run test_mobile_api.py (FastAPI TestClient):
+#   pip install httpx

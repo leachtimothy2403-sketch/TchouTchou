@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "TrainAware",
+    "slug": "trainaware",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tchoutchou.trainaware"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#3454d1",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.tchoutchou.trainaware"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "scheme": "trainaware",
+    "experiments": {
+      "typedRoutes": true
+    },
+    "plugins": [
+      "expo-router",
+      "expo-localization"
+    ],
+    "extra": {
+      "apiUrl": "",
+      "appKey": ""
+    }
+  }
+}

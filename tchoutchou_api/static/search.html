@@ -252,6 +252,18 @@
 </div>
 
 <script>
+// App key support (2026-10-06): when the server has TCHOUTCHOU_APP_KEYS set, open this
+// page once as  ...?key=YOUR_KEY  -- the key is remembered in this browser afterwards.
+const APP_KEY = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('key');
+  try {
+    if (fromUrl) localStorage.setItem('tchoutchou_app_key', fromUrl);
+    return fromUrl || localStorage.getItem('tchoutchou_app_key') || '';
+  } catch (e) { return fromUrl || ''; }
+})();
+const apiFetch = (url) => fetch(url, APP_KEY ? { headers: { 'X-App-Key': APP_KEY } } : {});
+</script>
+<script>
 'use strict';
 
 // ---------------------------------------------------------------------------
@@ -369,7 +381,7 @@ async function runSearch() {
   });
 
   try {
-    const res = await fetch(`/api/search?${qs.toString()}`);
+    const res = await apiFetch(`/api/search?${qs.toString()}`);
     let data;
     try {
       data = await res.json();

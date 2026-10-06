@@ -50,6 +50,36 @@ here -- this MVP is just the app itself).
   journey search setup" below. Backs `static/search.html` (added 2026-08-24), the real
   journey-search UI -- see that section below.
 
+## Mobile-readiness additions (2026-10-06)
+
+New for the TrainAware mobile app (`../tchoutchou_mobile`):
+
+- **Confidence tiers** (`confidence.py`). Every reliability payload now has `confidence`
+  (`tier`, five levels by trips recorded: `insufficient` < 5, `early` 5-9, `emerging` 10-19,
+  `solid` 20-49, `high` 50+, plus a numeric `level` 0-4; and a 95% Wilson interval on the
+  on-time rate), a `type_fallback` (stats for the whole train type, e.g. all TER) and a
+  `headline` telling the client which number to lead with: the train's own once it is above
+  *insufficient*, otherwise its train type's, clearly labelled. Thresholds are server-side
+  (`TCHOUTCHOU_TIER_THRESHOLDS="5,10,20,50"`) so web and app can never disagree on them.
+  Connection-risk estimates also fall back to train-type history when the incoming train
+  has too few trips, and say so in the transfer note.
+- **`GET /api/stations?q=`** -- accent-insensitive station autocomplete from the collector's
+  `stations` table (free), falling back to SNCF `/places` only when nothing matches locally.
+- **`GET /api/health`** -- unauthenticated liveness + data freshness
+  (`stats_updated_at_utc`) + today's SNCF call budget.
+- **App key** (`TCHOUTCHOU_APP_KEYS`), **rate limits** (`security.py`) and a **daily SNCF
+  call budget** (`SNCF_DAILY_BUDGET`, default 4,500) for public exposure. All off/loose by
+  default, so local use is unchanged. See `deploy/README_TUNNEL.md`.
+- **CORS** (`TCHOUTCHOU_CORS_ORIGINS`) only for browser clients on another origin (e.g.
+  the Expo app running as a web page during development).
+- The web pages (`static/*.html`) send the app key if you open them once as `?key=...`.
+- `dev_mock_server.py` runs this exact API against a fake database and fake SNCF journeys
+  (no key, no real data) -- every UI state is covered, handy for trying the app.
+  Train lookup: 6683 (running, +4 min), 6689 (cancelled), 87421 (no live delays).
+
+Tests (no network, no SNCF key): `python test_search_local.py` and
+`python test_mobile_api.py`.
+
 ## SNCF journey search setup
 
 `/api/search` calls SNCF's public journey-planning API (Navitia-based) to generate the
